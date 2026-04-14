@@ -80,6 +80,13 @@ pub fn evaluate_guardrails(
 
     let verdict = if warnings.is_empty() {
         GuardrailVerdict::Pass
+    } else if warnings.iter().any(|w| {
+        matches!(
+            w.rule.as_str(),
+            "no_legal_liability" | "no_staff_pii"
+        )
+    }) {
+        GuardrailVerdict::Fail
     } else {
         GuardrailVerdict::Warn
     };
@@ -320,7 +327,7 @@ mod tests {
             &ctx(Platform::Google, 1),
             &checks,
         );
-        assert_eq!(result.verdict, GuardrailVerdict::Warn);
+        assert_eq!(result.verdict, GuardrailVerdict::Fail);
     }
 
     #[test]
@@ -331,7 +338,7 @@ mod tests {
             &ctx(Platform::Google, 3),
             &checks,
         );
-        assert_eq!(result.verdict, GuardrailVerdict::Warn);
+        assert_eq!(result.verdict, GuardrailVerdict::Fail);
         assert_eq!(result.warnings[0].rule, "no_staff_pii");
     }
 
@@ -343,7 +350,7 @@ mod tests {
             &ctx(Platform::Google, 3),
             &checks,
         );
-        assert_eq!(result.verdict, GuardrailVerdict::Warn);
+        assert_eq!(result.verdict, GuardrailVerdict::Fail);
     }
 
     #[test]
