@@ -74,6 +74,8 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Metrics emission for core flows** (ingestion/agent/posting/notifications/http/db) per `specs/coder/12-observability.md`.
   - **Readiness checks** (DB + secrets reachable) per `specs/coder/12-observability.md` and `specs/coder/11-api-design.md`.
     - Current: `/readyz` now does repository ping and returns `503` `application/problem+json` on failure; secrets reachability still pending until a secrets backend exists.
+    - Remaining gap: server currently constructs `Store::new()` (in-memory repo) unconditionally, so `/readyz` only truly checks DB connectivity once the server is wired to `PgRepository` when `DATABASE_URL` is configured.
+    - Pointers: `crates/server/src/main.rs`, `crates/api/src/store.rs`.
     - Code: `crates/api/src/v1.rs`, `crates/api/src/problem.rs`, `crates/storage/src/repo.rs`.
   - **Implement config loading via `figment` + `APP_ENV` + `APP_` env prefix** per `specs/coder/13-deployment-infra.md` and `specs/coder/10-rust-tech-stack.md`.
     - Current: ad-hoc env reads, inconsistent naming (`APP_BIND_ADDR` vs `DATABASE_URL` vs `ANTHROPIC_API_KEY`), and no `config/` directory.
