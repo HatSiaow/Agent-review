@@ -1,5 +1,5 @@
-use domain::{ReplyDraft, Review};
-use sqlx::{PgPool, Pool, Postgres};
+use domain::{DraftState, ReplyDraft, Review};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
@@ -34,9 +34,9 @@ pub struct PgRepository {
 
 impl PgRepository {
     pub async fn connect(config: &PgRepositoryConfig) -> Result<Self, sqlx::Error> {
-        let pool = Pool::<Postgres>::builder()
+        let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.max_connections)
-            .build(&config.database_url)
+            .connect(&config.database_url)
             .await?;
         Ok(Self { pool })
     }
@@ -128,13 +128,14 @@ fn parse_generator(s: &str) -> Result<domain::Generator, RepositoryError> {
     }
 }
 
-fn parse_draft_state(s: &str) -> Result<domain::fsm::DraftState, RepositoryError> {
+fn parse_draft_state(s: &str) -> Result<DraftState, RepositoryError> {
     match s {
-        "pending_review" => Ok(domain::fsm::DraftState::PendingReview),
-        "approved" => Ok(domain::fsm::DraftState::Approved),
-        "edited" => Ok(domain::fsm::DraftState::Edited),
-        "rejected" => Ok(domain::fsm::DraftState::Rejected),
-        "posted" => Ok(domain::fsm::DraftState::Posted),
+        "pending_review" => Ok(DraftState::PendingReview),
+        "approved" => Ok(DraftState::Approved),
+        "edited" => Ok(DraftState::Edited),
+        "rejected" => Ok(DraftState::Rejected),
+        "posted" => Ok(DraftState::Posted),
+        "failed" => Ok(DraftState::Failed),
         _ => Err(RepositoryError::Storage("invalid draft state".to_string())),
     }
 }
@@ -195,95 +196,46 @@ fn draft_from_row(row: DraftRow) -> Result<ReplyDraft, RepositoryError> {
 
 impl Repository for PgRepository {
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
-        let rows: Vec<(ReviewRow, Option<DraftRow>)> = sqlx::query_as(
-            r#"
-            select
-              r.*,
-              d.id as "d_id?",
-              d.review_id as "d_review_id?",
-              d.generated_by as "d_generated_by?",
-              d.model_name as "d_model_name?",
-              d.prompt_fingerprint as "d_prompt_fingerprint?",
-              d.text as "d_text?",
-              d.language as "d_language?",
-              d.char_count as "d_char_count?",
-              d.state as "d_state?",
-              d.guardrail_warnings as "d_guardrail_warnings?",
-              d.flags as "d_flags?",
-              d.created_at as "d_created_at?",
-              d.reviewed_by as "d_reviewed_by?",
-              d.reviewed_at as "d_reviewed_at?",
-              d.rejection_reason as "d_rejection_reason?",
-              d.posted_at as "d_posted_at?",
-              d.platform_post_error as "d_platform_post_error?"
-            from reviews r
-            left join lateral (
-              select *
-              from reply_drafts
-              where review_id = r.id
-              order by created_at desc
-              limit 1
-            ) d on true
-            order by r.updated_at desc
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        let reviews: Vec<ReviewRow> =
+            sqlx::query_as("select * from reviews order by updated_at desc")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Storage(e.to_string()))?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for (r, dopt) in rows {
+        let mut out = Vec::with_capacity(reviews.len());
+        for r in reviews {
             let review = review_from_row(r)?;
-            let draft = dopt.map(draft_from_row).transpose()?;
+            let d: Option<DraftRow> = sqlx::query_as(
+                "select * from reply_drafts where review_id = $1 order by created_at desc limit 1",
+            )
+            .bind(review.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+            let draft = d.map(draft_from_row).transpose()?;
             out.push((review, draft));
         }
         Ok(out)
     }
 
-    async fn get_review(&self, _id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)> {
-        let row: Option<(ReviewRow, Option<DraftRow>)> = sqlx::query_as(
-            r#"
-            select
-              r.*,
-              d.id as "d_id?",
-              d.review_id as "d_review_id?",
-              d.generated_by as "d_generated_by?",
-              d.model_name as "d_model_name?",
-              d.prompt_fingerprint as "d_prompt_fingerprint?",
-              d.text as "d_text?",
-              d.language as "d_language?",
-              d.char_count as "d_char_count?",
-              d.state as "d_state?",
-              d.guardrail_warnings as "d_guardrail_warnings?",
-              d.flags as "d_flags?",
-              d.created_at as "d_created_at?",
-              d.reviewed_by as "d_reviewed_by?",
-              d.reviewed_at as "d_reviewed_at?",
-              d.rejection_reason as "d_rejection_reason?",
-              d.posted_at as "d_posted_at?",
-              d.platform_post_error as "d_platform_post_error?"
-            from reviews r
-            left join lateral (
-              select *
-              from reply_drafts
-              where review_id = r.id
-              order by created_at desc
-              limit 1
-            ) d on true
-            where r.id = $1
-            "#,
-        )
-        .bind(_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
-
-        let Some((r, dopt)) = row else {
+    async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)> {
+        let r: Option<ReviewRow> = sqlx::query_as("select * from reviews where id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        let Some(r) = r else {
             return Err(RepositoryError::NotFound);
         };
         let review = review_from_row(r)?;
-        let draft = dopt.map(draft_from_row).transpose()?;
-        Ok((review, draft))
+        let d: Option<DraftRow> = sqlx::query_as(
+            "select * from reply_drafts where review_id = $1 order by created_at desc limit 1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok((review, d.map(draft_from_row).transpose()?))
     }
 
     async fn ingest_review(&self, _review: Review) -> RepositoryResult<()> {

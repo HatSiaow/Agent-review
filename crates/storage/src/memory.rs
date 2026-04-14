@@ -274,7 +274,7 @@ impl Repository for InMemoryRepository {
             .get_mut(&draft_id)
             .ok_or(RepositoryError::NotFound)?;
         let fsm = DraftFsm::new(draft.state)
-            .apply(DraftEvent::Fail)
+            .apply(DraftEvent::MarkFailed)
             .map_err(|_| RepositoryError::InvalidTransition)?;
         draft.state = fsm.state();
         draft.platform_post_error = Some(error);
