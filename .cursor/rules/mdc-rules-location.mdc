@@ -1,0 +1,13 @@
+---
+description: Store Cursor MDC rules in .cursor/rules (one rule per file)
+alwaysApply: true
+---
+
+# Cursor MDC rule location
+
+When creating **new Cursor MDC rules** for this repository:
+
+- Always create them as `.mdc` files under `.cursor/rules/`.
+- Put **exactly one rule per file** (do not combine unrelated rules into a single `.mdc`).
+- Use clear, kebab-case filenames that describe the rule (for example: `react-standards.mdc`, `python-formatting.mdc`).
+

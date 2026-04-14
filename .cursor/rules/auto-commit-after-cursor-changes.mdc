@@ -1,0 +1,23 @@
+---
+description: Auto-commit files after Cursor-applied changes
+alwaysApply: true
+---
+
+# Auto-commit after Cursor changes
+
+If Cursor applies changes to the working tree (including changes triggered by actions like preparing a git commit), then **immediately create a git commit** for those changes.
+
+## Commit requirements
+
+- Use a **Conventional Commits** style title: `type(scope): summary`
+  - Examples: `chore(cursor): add new rule`, `fix(api): handle null token`
+- Include a commit body that answers:
+  - **What changed** (bullet list of key file-level changes)
+  - **Why it changed** (the intent / reasoning)
+  - **Prompt trace**: a short summary of the instruction(s) that caused the change (paraphrased; do not include secrets)
+
+## Safety checks
+
+- Do **not** commit secrets (for example `.env`, credentials, API keys).
+- Review `git diff` before committing; if the diff includes unrelated changes, split them into separate commits.
+
