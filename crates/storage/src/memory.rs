@@ -27,6 +27,7 @@ impl InMemoryRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl Repository for InMemoryRepository {
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
         let state = self.0.lock().await;

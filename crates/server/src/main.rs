@@ -144,8 +144,8 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
     let google_cfg = adapter_google::GoogleConfig::default();
     let ubereats_cfg = adapter_ubereats::UberEatsConfig::default();
     let http_poster = poster::HttpPlatformPoster::new(
-        Some((adapter_google::HttpGoogleClient::new(), google_cfg)),
-        Some((adapter_ubereats::HttpUberEatsClient::new(), ubereats_cfg)),
+        Some(google_cfg),
+        Some(ubereats_cfg),
     );
 
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));

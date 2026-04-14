@@ -194,6 +194,7 @@ fn draft_from_row(row: DraftRow) -> Result<ReplyDraft, RepositoryError> {
     })
 }
 
+#[async_trait::async_trait]
 impl Repository for PgRepository {
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
         let reviews: Vec<ReviewRow> =

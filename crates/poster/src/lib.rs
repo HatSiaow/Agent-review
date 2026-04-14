@@ -52,15 +52,15 @@ pub trait PlatformPoster: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct HttpPlatformPoster {
-    google: Option<(HttpGoogleClient, GoogleConfig)>,
-    ubereats: Option<(HttpUberEatsClient, UberEatsConfig)>,
+    google: Option<GoogleConfig>,
+    ubereats: Option<UberEatsConfig>,
 }
 
 impl HttpPlatformPoster {
     #[must_use]
     pub fn new(
-        google: Option<(HttpGoogleClient, GoogleConfig)>,
-        ubereats: Option<(HttpUberEatsClient, UberEatsConfig)>,
+        google: Option<GoogleConfig>,
+        ubereats: Option<UberEatsConfig>,
     ) -> Self {
         Self { google, ubereats }
     }
@@ -109,7 +109,7 @@ impl PlatformPoster for HttpPlatformPoster {
     ) -> Result<(), PostError> {
         match platform {
             Platform::Google => {
-                let Some((client, cfg)) = self.google.clone() else {
+                let Some(cfg) = self.google.clone() else {
                     return Err(PostError::NetworkError {
                         platform,
                         message: "google poster not configured".into(),
@@ -117,7 +117,10 @@ impl PlatformPoster for HttpPlatformPoster {
                 };
                 let review_id = source_review_id.to_string();
                 let reply = reply_text.to_string();
-                tokio::task::spawn_blocking(move || client.post_reply(&cfg, &review_id, &reply))
+                tokio::task::spawn_blocking(move || {
+                    let client = HttpGoogleClient::new();
+                    client.post_reply(&cfg, &review_id, &reply)
+                })
                     .await
                     .map_err(|e| PostError::NetworkError {
                         platform,
@@ -138,7 +141,7 @@ impl PlatformPoster for HttpPlatformPoster {
                     })
             }
             Platform::Ubereats => {
-                let Some((client, cfg)) = self.ubereats.clone() else {
+                let Some(cfg) = self.ubereats.clone() else {
                     return Err(PostError::NetworkError {
                         platform,
                         message: "ubereats poster not configured".into(),
@@ -146,7 +149,10 @@ impl PlatformPoster for HttpPlatformPoster {
                 };
                 let review_id = source_review_id.to_string();
                 let reply = reply_text.to_string();
-                tokio::task::spawn_blocking(move || client.post_reply(&cfg, &review_id, &reply))
+                tokio::task::spawn_blocking(move || {
+                    let client = HttpUberEatsClient::new();
+                    client.post_reply(&cfg, &review_id, &reply)
+                })
                     .await
                     .map_err(|e| PostError::NetworkError {
                         platform,
