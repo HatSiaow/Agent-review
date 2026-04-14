@@ -43,6 +43,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/server/src/main.rs`, `crates/storage`, plus new queue/outbox abstractions.
   - **Ingestion orchestration** (Google polling with stop-at-watermark; UberEats webhook enqueues + polling fallback “since last created_at”; per-location sync state) per `specs/coder/02-google-reviews-integration.md`, `specs/coder/03-ubereats-reviews-integration.md`.
     - Remaining: “enqueue + polling fallback” orchestration, DLQ behaviors, and per-location fanout/locking (watermark persistence is now in place).
+    - **P0/P1: UberEats polling lacks a persisted watermark / `since` usage** — `ubereats_tick` re-ingests the full review list each tick instead of passing a persisted “since last seen created_at” (or equivalent) into the adapter. Pointers: `crates/server/src/main.rs` (`ubereats_tick`), `crates/adapters/ubereats/src/lib.rs` (`list_reviews`).
     - Code: `crates/ingestion/src/lib.rs`, `crates/adapters/{google,ubereats}/src/lib.rs`, `crates/api/src/webhooks.rs`, `crates/storage/src/{pg.rs,repo.rs}`.
   - **Poster worker correctness** (idempotent posting, drift detection, retries persisted, surface platform rejections) per `specs/coder/01-architecture.md` and platform specs (`02`, `03`).
     - Current: retries exist but no durable job records; drift detection is largely missing.
