@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{fmt, fmt::Formatter};
 
 use domain::{ReplyDraft, Review};
 use uuid::Uuid;
@@ -8,6 +9,12 @@ use crate::problem::ApiError;
 #[derive(Clone)]
 pub struct Store {
     repo: Arc<dyn storage::Repository>,
+}
+
+impl fmt::Debug for Store {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("Store(..)")
+    }
 }
 
 impl Default for Store {
