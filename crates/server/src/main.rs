@@ -54,7 +54,7 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::info!("ingestion worker stopped");
                 return;
             }
@@ -93,9 +93,10 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
 
     // Prefer Anthropic if configured; otherwise use the deterministic in-memory fake.
     let llm: Box<dyn llm_client::LlmClient> = if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        let mut cfg = llm_client::LlmConfig::default();
-        cfg.api_key = Some(key);
-        Box::new(llm_client::AnthropicClient::new(cfg))
+        Box::new(llm_client::AnthropicClient::new(llm_client::LlmConfig {
+            api_key: Some(key),
+            ..llm_client::LlmConfig::default()
+        }))
     } else {
         Box::new(llm_client::InMemoryLlm::default())
     };
@@ -104,7 +105,7 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::info!("agent worker stopped");
                 return;
             }
@@ -148,7 +149,7 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::info!("poster worker stopped");
                 return;
             }
@@ -162,9 +163,8 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
                         continue;
                     }
 
-                    let (review, _) = match store.get_review(draft.review_id).await {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let Ok((review, _)) = store.get_review(draft.review_id).await else {
+                        continue;
                     };
 
                     if poster::validate_for_posting(&draft).is_err() {
@@ -201,7 +201,7 @@ async fn notifier_worker(store: api::Store, cancel: CancellationToken) {
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::info!("notifier worker stopped");
                 return;
             }
