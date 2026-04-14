@@ -212,6 +212,11 @@ pub struct ReplyDraft {
     #[serde(with = "time::serde::rfc3339::option")]
     pub reviewed_at: Option<OffsetDateTime>,
     pub rejection_reason: Option<String>,
+    /// Earliest time the system may begin posting this draft to the platform.
+    ///
+    /// Used to enforce the 10-second undo window for bulk approvals.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub post_eligible_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub posted_at: Option<OffsetDateTime>,
     pub platform_post_error: Option<String>,
@@ -238,6 +243,7 @@ impl ReplyDraft {
             reviewed_by: None,
             reviewed_at: None,
             rejection_reason: None,
+            post_eligible_at: None,
             posted_at: None,
             platform_post_error: None,
         }

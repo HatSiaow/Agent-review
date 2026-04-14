@@ -9,6 +9,7 @@ use thiserror::Error;
 pub enum DraftState {
     PendingReview,
     Approved,
+    ApprovedPendingUndo,
     Edited,
     Rejected,
     Posted,
@@ -28,6 +29,7 @@ impl fmt::Display for DraftState {
         match self {
             Self::PendingReview => f.write_str("pending_review"),
             Self::Approved => f.write_str("approved"),
+            Self::ApprovedPendingUndo => f.write_str("approved_pending_undo"),
             Self::Edited => f.write_str("edited"),
             Self::Rejected => f.write_str("rejected"),
             Self::Posted => f.write_str("posted"),
@@ -40,6 +42,8 @@ impl fmt::Display for DraftState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DraftEvent {
     Approve,
+    BulkApprove,
+    UndoBulkApprove,
     Edit,
     Reject,
     MarkPosted,
@@ -50,6 +54,8 @@ impl fmt::Display for DraftEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Approve => f.write_str("approve"),
+            Self::BulkApprove => f.write_str("bulk_approve"),
+            Self::UndoBulkApprove => f.write_str("undo_bulk_approve"),
             Self::Edit => f.write_str("edit"),
             Self::Reject => f.write_str("reject"),
             Self::MarkPosted => f.write_str("mark_posted"),
@@ -96,6 +102,10 @@ fn transition(from: DraftState, event: DraftEvent) -> Result<DraftState, Invalid
     let to = match (from, event) {
         // PendingReview
         (DraftState::PendingReview, DraftEvent::Approve) => DraftState::Approved,
+        (DraftState::PendingReview, DraftEvent::BulkApprove) => DraftState::ApprovedPendingUndo,
+        (DraftState::PendingReview, DraftEvent::UndoBulkApprove) => {
+            return Err(InvalidTransition { from, event });
+        }
         (DraftState::PendingReview, DraftEvent::Edit) => DraftState::Edited,
         (DraftState::PendingReview, DraftEvent::Reject) => DraftState::Rejected,
         (DraftState::PendingReview, DraftEvent::MarkPosted | DraftEvent::MarkFailed) => {
@@ -106,13 +116,30 @@ fn transition(from: DraftState, event: DraftEvent) -> Result<DraftState, Invalid
         (DraftState::Approved, DraftEvent::Approve) => {
             return Err(InvalidTransition { from, event });
         }
+        (DraftState::Approved, DraftEvent::BulkApprove | DraftEvent::UndoBulkApprove) => {
+            return Err(InvalidTransition { from, event });
+        }
         (DraftState::Approved, DraftEvent::Edit) => DraftState::Edited,
         (DraftState::Approved, DraftEvent::Reject) => DraftState::Rejected,
         (DraftState::Approved, DraftEvent::MarkPosted) => DraftState::Posted,
         (DraftState::Approved, DraftEvent::MarkFailed) => DraftState::Failed,
 
+        // ApprovedPendingUndo
+        (DraftState::ApprovedPendingUndo, DraftEvent::UndoBulkApprove) => DraftState::PendingReview,
+        (DraftState::ApprovedPendingUndo, DraftEvent::Edit) => DraftState::Edited,
+        (DraftState::ApprovedPendingUndo, DraftEvent::Reject) => DraftState::Rejected,
+        (DraftState::ApprovedPendingUndo, DraftEvent::MarkPosted) => DraftState::Posted,
+        (DraftState::ApprovedPendingUndo, DraftEvent::MarkFailed) => DraftState::Failed,
+        (DraftState::ApprovedPendingUndo, DraftEvent::Approve | DraftEvent::BulkApprove) => {
+            return Err(InvalidTransition { from, event });
+        }
+
         // Edited
         (DraftState::Edited, DraftEvent::Approve) => DraftState::Approved,
+        (DraftState::Edited, DraftEvent::BulkApprove) => DraftState::ApprovedPendingUndo,
+        (DraftState::Edited, DraftEvent::UndoBulkApprove) => {
+            return Err(InvalidTransition { from, event });
+        }
         (DraftState::Edited, DraftEvent::Reject) => DraftState::Rejected,
         (
             DraftState::Edited,
@@ -251,6 +278,8 @@ mod tests {
     fn rejected_is_terminal() {
         for event in [
             DraftEvent::Approve,
+            DraftEvent::BulkApprove,
+            DraftEvent::UndoBulkApprove,
             DraftEvent::Edit,
             DraftEvent::Reject,
             DraftEvent::MarkPosted,
@@ -264,6 +293,8 @@ mod tests {
     fn posted_is_immutable() {
         for event in [
             DraftEvent::Approve,
+            DraftEvent::BulkApprove,
+            DraftEvent::UndoBulkApprove,
             DraftEvent::Edit,
             DraftEvent::Reject,
             DraftEvent::MarkPosted,
@@ -277,6 +308,8 @@ mod tests {
     fn failed_is_terminal() {
         for event in [
             DraftEvent::Approve,
+            DraftEvent::BulkApprove,
+            DraftEvent::UndoBulkApprove,
             DraftEvent::Edit,
             DraftEvent::Reject,
             DraftEvent::MarkPosted,

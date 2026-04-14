@@ -46,6 +46,15 @@ impl Store {
             storage::RepositoryError::Conflict("bulk_approve_requires_5_star") => {
                 ApiError::BadRequest("bulk-approve is only allowed for 5-star reviews")
             }
+            storage::RepositoryError::Conflict("undo_not_reviewer") => {
+                ApiError::BadRequest("only the approving user can undo this bulk approve")
+            }
+            storage::RepositoryError::Conflict("undo_not_bulk_approved") => {
+                ApiError::BadRequest("draft is not in bulk-approve undo window")
+            }
+            storage::RepositoryError::Conflict("undo_window_elapsed") => {
+                ApiError::BadRequest("undo window elapsed")
+            }
             storage::RepositoryError::Conflict(_) | storage::RepositoryError::Storage(_) => {
                 ApiError::BadRequest("storage error")
             }
@@ -128,6 +137,18 @@ impl Store {
     ) -> Result<Vec<ReplyDraft>, ApiError> {
         self.repo
             .bulk_approve(draft_ids, reviewed_by)
+            .await
+            .map_err(|e| Self::map_err(&e))
+    }
+
+    pub async fn undo_bulk_approve(
+        &self,
+        draft_ids: &[Uuid],
+        reviewed_by: Uuid,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<ReplyDraft>, ApiError> {
+        self.repo
+            .undo_bulk_approve(draft_ids, reviewed_by, now)
             .await
             .map_err(|e| Self::map_err(&e))
     }

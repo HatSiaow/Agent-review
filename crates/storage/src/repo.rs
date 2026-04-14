@@ -53,6 +53,14 @@ pub trait Repository: Send + Sync + 'static {
         reviewed_by: Uuid,
     ) -> RepositoryResult<Vec<ReplyDraft>>;
 
+    /// Undo a previous bulk-approve during the undo window.
+    async fn undo_bulk_approve(
+        &self,
+        draft_ids: &[Uuid],
+        reviewed_by: Uuid,
+        now: time::OffsetDateTime,
+    ) -> RepositoryResult<Vec<ReplyDraft>>;
+
     async fn mark_draft_posted(
         &self,
         draft_id: Uuid,

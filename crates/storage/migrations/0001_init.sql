@@ -42,6 +42,7 @@ create table if not exists reply_drafts (
   reviewed_by uuid null,
   reviewed_at timestamptz null,
   rejection_reason text null,
+  post_eligible_at timestamptz null,
   posted_at timestamptz null,
   platform_post_error text null
 );

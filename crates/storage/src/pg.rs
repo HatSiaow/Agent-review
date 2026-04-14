@@ -95,6 +95,7 @@ struct DraftRow {
     reviewed_by: Option<Uuid>,
     reviewed_at: Option<OffsetDateTime>,
     rejection_reason: Option<String>,
+    post_eligible_at: Option<OffsetDateTime>,
     posted_at: Option<OffsetDateTime>,
     platform_post_error: Option<String>,
 }
@@ -132,6 +133,7 @@ fn parse_draft_state(s: &str) -> Result<DraftState, RepositoryError> {
     match s {
         "pending_review" => Ok(DraftState::PendingReview),
         "approved" => Ok(DraftState::Approved),
+        "approved_pending_undo" => Ok(DraftState::ApprovedPendingUndo),
         "edited" => Ok(DraftState::Edited),
         "rejected" => Ok(DraftState::Rejected),
         "posted" => Ok(DraftState::Posted),
@@ -189,6 +191,7 @@ fn draft_from_row(row: DraftRow) -> Result<ReplyDraft, RepositoryError> {
         reviewed_by: row.reviewed_by,
         reviewed_at: row.reviewed_at,
         rejection_reason: row.rejection_reason,
+        post_eligible_at: row.post_eligible_at,
         posted_at: row.posted_at,
         platform_post_error: row.platform_post_error,
     })
@@ -363,14 +366,14 @@ impl Repository for PgRepository {
               guardrail_warnings, flags,
               created_at,
               reviewed_by, reviewed_at, rejection_reason,
-              posted_at, platform_post_error
+              post_eligible_at, posted_at, platform_post_error
             ) values (
               $1,$2,$3,$4,$5,
               $6,$7,$8,$9,
               $10,$11,
               $12,
               $13,$14,$15,
-              $16,$17
+              $16,$17,$18
             )
             ",
         )
@@ -389,6 +392,7 @@ impl Repository for PgRepository {
         .bind(_draft.reviewed_by)
         .bind(_draft.reviewed_at)
         .bind(_draft.rejection_reason)
+        .bind(_draft.post_eligible_at)
         .bind(_draft.posted_at)
         .bind(_draft.platform_post_error)
         .execute(&self.pool)
@@ -440,11 +444,13 @@ impl Repository for PgRepository {
             update reply_drafts
             set state = 'approved',
                 reviewed_by = $1,
-                reviewed_at = $2
-            where id = $3 and state in ('pending_review','edited')
+                reviewed_at = $2,
+                post_eligible_at = $3
+            where id = $4 and state in ('pending_review','edited')
             ",
         )
         .bind(_reviewed_by)
+        .bind(now)
         .bind(now)
         .bind(_draft_id)
         .execute(&self.pool)
@@ -502,9 +508,119 @@ impl Repository for PgRepository {
         _draft_ids: &[Uuid],
         _reviewed_by: Uuid,
     ) -> RepositoryResult<Vec<ReplyDraft>> {
+        let now = OffsetDateTime::now_utc();
+        let post_eligible_at = now + time::Duration::seconds(10);
+
+        // Validate all ids are safe for bulk approve: 5-star + no warnings.
+        for &id in _draft_ids {
+            let row: DraftRow = sqlx::query_as("select * from reply_drafts where id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Storage(e.to_string()))?
+                .ok_or(RepositoryError::NotFound)?;
+            if !row.guardrail_warnings.as_array().is_some_and(|a| a.is_empty()) {
+                return Err(RepositoryError::Conflict("draft_has_guardrail_warnings"));
+            }
+
+            let review_rating: Option<i16> =
+                sqlx::query_scalar("select rating from reviews where id = $1")
+                    .bind(row.review_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+            let Some(rating) = review_rating else {
+                return Err(RepositoryError::NotFound);
+            };
+            if rating != 5 {
+                return Err(RepositoryError::Conflict("bulk_approve_requires_5_star"));
+            }
+        }
+
         let mut out = Vec::with_capacity(_draft_ids.len());
         for &id in _draft_ids {
-            out.push(self.approve_draft(id, _reviewed_by, None).await?);
+            let res = sqlx::query(
+                r"
+                update reply_drafts
+                set state = 'approved_pending_undo',
+                    reviewed_by = $1,
+                    reviewed_at = $2,
+                    post_eligible_at = $3
+                where id = $4 and state in ('pending_review','edited')
+                ",
+            )
+            .bind(_reviewed_by)
+            .bind(now)
+            .bind(post_eligible_at)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+            if res.rows_affected() == 0 {
+                return Err(RepositoryError::InvalidTransition);
+            }
+
+            let row: DraftRow = sqlx::query_as("select * from reply_drafts where id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+            out.push(draft_from_row(row)?);
+        }
+
+        Ok(out)
+    }
+
+    async fn undo_bulk_approve(
+        &self,
+        draft_ids: &[Uuid],
+        reviewed_by: Uuid,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Vec<ReplyDraft>> {
+        let mut out = Vec::with_capacity(draft_ids.len());
+        for &id in draft_ids {
+            let row: DraftRow = sqlx::query_as("select * from reply_drafts where id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Storage(e.to_string()))?
+                .ok_or(RepositoryError::NotFound)?;
+
+            if row.reviewed_by != Some(reviewed_by) {
+                return Err(RepositoryError::Conflict("undo_not_reviewer"));
+            }
+            let Some(eligible_at) = row.post_eligible_at else {
+                return Err(RepositoryError::Conflict("undo_not_bulk_approved"));
+            };
+            if now >= eligible_at {
+                return Err(RepositoryError::Conflict("undo_window_elapsed"));
+            }
+
+            let res = sqlx::query(
+                r"
+                update reply_drafts
+                set state = 'pending_review',
+                    reviewed_at = $1,
+                    post_eligible_at = null
+                where id = $2 and state = 'approved_pending_undo'
+                ",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(RepositoryError::InvalidTransition);
+            }
+
+            let row2: DraftRow = sqlx::query_as("select * from reply_drafts where id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+            out.push(draft_from_row(row2)?);
         }
         Ok(out)
     }
@@ -519,8 +635,9 @@ impl Repository for PgRepository {
             update reply_drafts
             set state = 'posted',
                 posted_at = $1,
-                platform_post_error = null
-            where id = $2 and state = 'approved'
+                platform_post_error = null,
+                post_eligible_at = null
+            where id = $2 and state in ('approved','approved_pending_undo')
             ",
         )
         .bind(posted_at)
@@ -548,8 +665,9 @@ impl Repository for PgRepository {
             r"
             update reply_drafts
             set state = 'failed',
-                platform_post_error = $1
-            where id = $2 and state = 'approved'
+                platform_post_error = $1,
+                post_eligible_at = null
+            where id = $2 and state in ('approved','approved_pending_undo')
             ",
         )
         .bind(error)

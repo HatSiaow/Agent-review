@@ -156,10 +156,26 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
             _ = tick.tick() => {
                 let drafts = store.list_drafts().await;
                 for draft in drafts {
-                    if draft.state != domain::DraftState::Approved {
+                    if draft.posted_at.is_some() {
                         continue;
                     }
-                    if draft.posted_at.is_some() {
+                    let now = time::OffsetDateTime::now_utc();
+                    let eligible = match draft.state {
+                        domain::DraftState::Approved => {
+                            match draft.post_eligible_at {
+                                None => true,
+                                Some(t) => now >= t,
+                            }
+                        }
+                        domain::DraftState::ApprovedPendingUndo => {
+                            match draft.post_eligible_at {
+                                None => false,
+                                Some(t) => now >= t,
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !eligible {
                         continue;
                     }
 

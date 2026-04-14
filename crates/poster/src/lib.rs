@@ -250,6 +250,7 @@ mod tests {
             reviewed_by: None,
             reviewed_at: None,
             rejection_reason: None,
+            post_eligible_at: None,
             posted_at: None,
             platform_post_error: None,
         }

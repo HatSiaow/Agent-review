@@ -1,6 +1,7 @@
 //! HTTP API (axum) for Agent-review.
 
 mod problem;
+mod auth;
 mod store;
 mod v1;
 mod webhooks;

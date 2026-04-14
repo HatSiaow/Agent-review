@@ -167,6 +167,7 @@ impl Repository for InMemoryRepository {
             draft.state = fsm.state();
             draft.reviewed_by = Some(reviewed_by);
             draft.reviewed_at = Some(OffsetDateTime::now_utc());
+            draft.post_eligible_at = Some(OffsetDateTime::now_utc());
 
             (review_id, draft.clone())
         };
@@ -207,6 +208,8 @@ impl Repository for InMemoryRepository {
     ) -> RepositoryResult<Vec<ReplyDraft>> {
         let mut state = self.0.lock().await;
         let mut results = Vec::with_capacity(draft_ids.len());
+        let now = OffsetDateTime::now_utc();
+        let post_eligible_at = now + time::Duration::seconds(10);
 
         for &draft_id in draft_ids {
             let draft = state.drafts.get(&draft_id).ok_or(RepositoryError::NotFound)?;
@@ -224,7 +227,7 @@ impl Repository for InMemoryRepository {
             }
 
             let fsm = DraftFsm::new(draft.state)
-                .apply(DraftEvent::Approve)
+                .apply(DraftEvent::BulkApprove)
                 .map_err(|_| RepositoryError::InvalidTransition)?;
 
             let draft = state
@@ -233,7 +236,46 @@ impl Repository for InMemoryRepository {
                 .ok_or(RepositoryError::NotFound)?;
             draft.state = fsm.state();
             draft.reviewed_by = Some(reviewed_by);
-            draft.reviewed_at = Some(OffsetDateTime::now_utc());
+            draft.reviewed_at = Some(now);
+            draft.post_eligible_at = Some(post_eligible_at);
+            results.push(draft.clone());
+        }
+
+        Ok(results)
+    }
+
+    async fn undo_bulk_approve(
+        &self,
+        draft_ids: &[Uuid],
+        reviewed_by: Uuid,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Vec<ReplyDraft>> {
+        let mut state = self.0.lock().await;
+        let mut results = Vec::with_capacity(draft_ids.len());
+
+        for &draft_id in draft_ids {
+            let draft = state
+                .drafts
+                .get_mut(&draft_id)
+                .ok_or(RepositoryError::NotFound)?;
+
+            if draft.reviewed_by != Some(reviewed_by) {
+                return Err(RepositoryError::Conflict("undo_not_reviewer"));
+            }
+
+            let Some(eligible_at) = draft.post_eligible_at else {
+                return Err(RepositoryError::Conflict("undo_not_bulk_approved"));
+            };
+            if now >= eligible_at {
+                return Err(RepositoryError::Conflict("undo_window_elapsed"));
+            }
+
+            let fsm = DraftFsm::new(draft.state)
+                .apply(DraftEvent::UndoBulkApprove)
+                .map_err(|_| RepositoryError::InvalidTransition)?;
+            draft.state = fsm.state();
+            draft.post_eligible_at = None;
+            draft.reviewed_at = Some(now);
             results.push(draft.clone());
         }
 
@@ -255,6 +297,7 @@ impl Repository for InMemoryRepository {
             .map_err(|_| RepositoryError::InvalidTransition)?;
         draft.state = fsm.state();
         draft.posted_at = Some(posted_at);
+        draft.post_eligible_at = None;
         Ok(draft.clone())
     }
 
@@ -273,6 +316,7 @@ impl Repository for InMemoryRepository {
             .map_err(|_| RepositoryError::InvalidTransition)?;
         draft.state = fsm.state();
         draft.platform_post_error = Some(error);
+        draft.post_eligible_at = None;
         Ok(draft.clone())
     }
 }

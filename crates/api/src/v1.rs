@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::auth::ActingUser;
 use crate::problem::ApiError;
 use crate::Store;
 
@@ -39,6 +40,7 @@ pub fn router(store: Store) -> Router {
         .route("/drafts/:id/approve", post(approve_draft))
         .route("/drafts/:id/reject", post(reject_draft))
         .route("/drafts/bulk-approve", post(bulk_approve))
+        .route("/drafts/bulk-approve/undo", post(undo_bulk_approve))
         .with_state(state)
 }
 
@@ -102,6 +104,7 @@ async fn get_review(
 async fn skip_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    _user: ActingUser,
 ) -> Result<Json<domain::Review>, ApiError> {
     let review = state.store.skip_review(id).await?;
     Ok(Json(review))
@@ -110,6 +113,7 @@ async fn skip_review(
 async fn unskip_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    _user: ActingUser,
 ) -> Result<Json<domain::Review>, ApiError> {
     let review = state.store.unskip_review(id).await?;
     Ok(Json(review))
@@ -133,6 +137,7 @@ struct RegenerateResponse {
 async fn regenerate_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    _user: ActingUser,
     Json(req): Json<RegenerateRequest>,
 ) -> Result<Json<RegenerateResponse>, ApiError> {
     let review = state.store.transition_review_to_drafting(id).await?;
@@ -153,8 +158,6 @@ async fn list_drafts(State(state): State<AppState>) -> Json<Vec<ReplyDraft>> {
 struct ApproveRequest {
     #[serde(default)]
     text: Option<String>,
-    #[serde(default)]
-    user_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,10 +171,13 @@ struct ApproveResponse {
 async fn approve_draft(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    user: ActingUser,
     Json(req): Json<ApproveRequest>,
 ) -> Result<Json<ApproveResponse>, ApiError> {
-    let user_id = req.user_id.unwrap_or_else(Uuid::new_v4);
-    let updated = state.store.approve_draft(id, user_id, req.text).await?;
+    if user.role == domain::UserRole::Viewer {
+        return Err(ApiError::Unauthorized);
+    }
+    let updated = state.store.approve_draft(id, user.id, req.text).await?;
 
     Ok(Json(ApproveResponse {
         id: updated.id,
@@ -183,33 +189,55 @@ async fn approve_draft(
 #[derive(Debug, Deserialize)]
 struct RejectRequest {
     reason: String,
-    #[serde(default)]
-    user_id: Option<Uuid>,
 }
 
 async fn reject_draft(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    user: ActingUser,
     Json(req): Json<RejectRequest>,
 ) -> Result<Json<ReplyDraft>, ApiError> {
-    let user_id = req.user_id.unwrap_or_else(Uuid::new_v4);
-    let updated = state.store.reject_draft(id, user_id, req.reason).await?;
+    if user.role == domain::UserRole::Viewer {
+        return Err(ApiError::Unauthorized);
+    }
+    let updated = state.store.reject_draft(id, user.id, req.reason).await?;
     Ok(Json(updated))
 }
 
 #[derive(Debug, Deserialize)]
 struct BulkApproveRequest {
     ids: Vec<Uuid>,
-    #[serde(default)]
-    user_id: Option<Uuid>,
 }
 
 async fn bulk_approve(
     State(state): State<AppState>,
+    user: ActingUser,
     Json(req): Json<BulkApproveRequest>,
 ) -> Result<Json<Vec<ReplyDraft>>, ApiError> {
-    let user_id = req.user_id.unwrap_or_else(Uuid::new_v4);
-    let updated = state.store.bulk_approve(&req.ids, user_id).await?;
+    if user.role != domain::UserRole::Owner {
+        return Err(ApiError::Unauthorized);
+    }
+    let updated = state.store.bulk_approve(&req.ids, user.id).await?;
+    Ok(Json(updated))
+}
+
+#[derive(Debug, Deserialize)]
+struct UndoBulkApproveRequest {
+    ids: Vec<Uuid>,
+}
+
+async fn undo_bulk_approve(
+    State(state): State<AppState>,
+    user: ActingUser,
+    Json(req): Json<UndoBulkApproveRequest>,
+) -> Result<Json<Vec<ReplyDraft>>, ApiError> {
+    if user.role != domain::UserRole::Owner {
+        return Err(ApiError::Unauthorized);
+    }
+    let updated = state
+        .store
+        .undo_bulk_approve(&req.ids, user.id, OffsetDateTime::now_utc())
+        .await?;
     Ok(Json(updated))
 }
 
@@ -224,6 +252,14 @@ mod tests {
     use serde_json::json;
     use time::macros::datetime;
     use tower::ServiceExt as _;
+
+    const TEST_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    fn auth_headers(builder: http::request::Builder, role: &str) -> http::request::Builder {
+        builder
+            .header("x-user-id", TEST_USER_ID)
+            .header("x-user-role", role)
+    }
 
     fn make_review_and_draft() -> (Uuid, Review, ReplyDraft) {
         let review_id = Uuid::new_v4();
@@ -347,12 +383,15 @@ mod tests {
         let app = build_router(store);
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/reviews/{review_id}/skip"))
-                .header("content-type", "application/json")
-                .body(Body::empty())
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/reviews/{review_id}/skip"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::empty())
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
     }
@@ -364,12 +403,15 @@ mod tests {
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/drafts/{draft_id}/approve"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/drafts/{draft_id}/approve"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
     }
@@ -381,12 +423,15 @@ mod tests {
         let body = serde_json::to_string(&json!({"reason": "too_generic"})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/drafts/{draft_id}/reject"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/drafts/{draft_id}/reject"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
     }
@@ -400,12 +445,15 @@ mod tests {
         // First reject
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/drafts/{draft_id}/reject"))
-                .header("content-type", "application/json")
-                .body(Body::from(body.clone()))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/drafts/{draft_id}/reject"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body.clone()))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
 
@@ -413,12 +461,15 @@ mod tests {
         let app2 = build_router(store);
         let res2 = oneshot(
             app2,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/drafts/{draft_id}/reject"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/drafts/{draft_id}/reject"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res2.status(), StatusCode::CONFLICT);
     }
@@ -445,12 +496,15 @@ mod tests {
         let app = build_router(store.clone());
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/reviews/{review_id}/skip"))
-                .header("content-type", "application/json")
-                .body(Body::empty())
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/reviews/{review_id}/skip"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::empty())
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
 
@@ -458,12 +512,15 @@ mod tests {
         let app2 = build_router(store);
         let res2 = oneshot(
             app2,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/reviews/{review_id}/unskip"))
-                .header("content-type", "application/json")
-                .body(Body::empty())
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/reviews/{review_id}/unskip"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::empty())
+            .unwrap(),
         );
         assert_eq!(res2.status(), StatusCode::OK);
     }
@@ -474,12 +531,15 @@ mod tests {
         let app = build_router(store);
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/reviews/{review_id}/unskip"))
-                .header("content-type", "application/json")
-                .body(Body::empty())
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/reviews/{review_id}/unskip"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::empty())
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::CONFLICT);
     }
@@ -505,12 +565,15 @@ mod tests {
         let body = serde_json::to_string(&json!({"text": "Edited thanks!"})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/drafts/{draft_id}/approve"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/drafts/{draft_id}/approve"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
     }
@@ -523,12 +586,15 @@ mod tests {
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/drafts/{fake_id}/approve"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/drafts/{fake_id}/approve"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
@@ -540,12 +606,15 @@ mod tests {
         let body = serde_json::to_string(&json!({"ids": [draft_id]})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/drafts/bulk-approve")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/drafts/bulk-approve")
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
     }
@@ -557,12 +626,15 @@ mod tests {
         let body = serde_json::to_string(&json!({"ids": []})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/drafts/bulk-approve")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/drafts/bulk-approve")
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
     }
@@ -575,12 +647,15 @@ mod tests {
         let body = serde_json::to_string(&json!({"ids": [fake_id]})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/drafts/bulk-approve")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/drafts/bulk-approve")
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
@@ -592,12 +667,15 @@ mod tests {
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/drafts/{draft_id}/reject"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/drafts/{draft_id}/reject"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -609,12 +687,15 @@ mod tests {
         let body = serde_json::to_string(&json!({"hint": "be warmer"})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/reviews/{review_id}/regenerate"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/reviews/{review_id}/regenerate"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
     }
@@ -627,13 +708,55 @@ mod tests {
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
             app,
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/reviews/{fake_id}/regenerate"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/reviews/{fake_id}/regenerate"))
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn undo_bulk_approve_endpoint_exists() {
+        let (store, _, draft_id) = seeded_store();
+
+        // Bulk approve first.
+        let app = build_router(store.clone());
+        let body = serde_json::to_string(&json!({"ids": [draft_id]})).unwrap();
+        let res = oneshot(
+            app,
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/drafts/bulk-approve")
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body))
+            .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Then undo (within window).
+        let app2 = build_router(store);
+        let body2 = serde_json::to_string(&json!({"ids": [draft_id]})).unwrap();
+        let res2 = oneshot(
+            app2,
+            auth_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/drafts/bulk-approve/undo")
+                    .header("content-type", "application/json"),
+                "owner",
+            )
+            .body(Body::from(body2))
+            .unwrap(),
+        );
+        assert_eq!(res2.status(), StatusCode::OK);
     }
 }

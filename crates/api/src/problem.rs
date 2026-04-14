@@ -20,6 +20,8 @@ pub enum ApiError {
     NotFound,
     #[error("invalid transition")]
     InvalidTransition,
+    #[error("unauthorized")]
+    Unauthorized,
     #[error("bad request: {0}")]
     BadRequest(&'static str),
 }
@@ -29,6 +31,7 @@ impl ApiError {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidTransition => StatusCode::CONFLICT,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
@@ -37,6 +40,7 @@ impl ApiError {
         match self {
             Self::NotFound => "not_found",
             Self::InvalidTransition => "invalid_transition",
+            Self::Unauthorized => "unauthorized",
             Self::BadRequest(_) => "bad_request",
         }
     }
@@ -45,6 +49,7 @@ impl ApiError {
         match self {
             Self::NotFound => "https://agent-review/errors/not-found",
             Self::InvalidTransition => "https://agent-review/errors/invalid-transition",
+            Self::Unauthorized => "https://agent-review/errors/unauthorized",
             Self::BadRequest(_) => "https://agent-review/errors/bad-request",
         }
     }
@@ -56,6 +61,7 @@ impl IntoResponse for ApiError {
         let title = match &self {
             Self::NotFound => "Not found",
             Self::InvalidTransition => "Invalid state transition",
+            Self::Unauthorized => "Unauthorized",
             Self::BadRequest(msg) => msg,
         };
 
