@@ -33,6 +33,7 @@ posted back to the originating platform automatically.
 | 13 | Deployment & Infrastructure | [specs/coder/13-deployment-infra.md](specs/coder/13-deployment-infra.md) | Hosting, CI/CD, environments |
 | 14 | Testing Strategy | [specs/coder/14-testing-strategy.md](specs/coder/14-testing-strategy.md) | Unit, integration, end-to-end, and LLM evaluation |
 | 15 | Security, Privacy & Compliance | [specs/coder/15-security-privacy-compliance.md](specs/coder/15-security-privacy-compliance.md) | PII handling, GDPR, platform TOS |
+| 16 | Frontend Web UI (Askama + htmx) | [specs/coder/16-frontend-web-ui.md](specs/coder/16-frontend-web-ui.md) | UI pages, queue flows, RBAC, error handling, htmx interaction patterns |
 
 ### For reviewers (diff + tests + acceptance criteria only)
 
