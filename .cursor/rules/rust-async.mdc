@@ -1,0 +1,20 @@
+---
+description: Rust async/await and concurrency best practices
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: async/await
+
+- Keep async boundaries deliberate:
+  - Don’t make functions `async` “just because”; only when awaiting.
+  - Prefer returning `impl Future<Output = ...>` only when it simplifies callers or avoids allocations.
+- Avoid blocking in async contexts:
+  - Don’t call blocking I/O or long CPU work on the async runtime thread pool unless explicitly offloaded.
+- Be careful with locks across `.await`:
+  - Never hold a `MutexGuard`/`RwLockGuard` across `.await` unless you fully control scheduling and understand deadlock risk.
+- Prefer structured concurrency:
+  - Ensure spawned tasks are tracked, cancellable, and errors are observed.
+- Make cancellation safe:
+  - Design operations to be restartable and to clean up partial state.
+

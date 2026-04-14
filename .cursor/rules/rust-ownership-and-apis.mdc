@@ -1,0 +1,25 @@
+---
+description: Rust ownership, borrowing, and API design recommendations
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: ownership & API design
+
+- Prefer borrowing in function parameters:
+  - Take `&T`, `&str`, `&[T]`, `impl AsRef<Path>` where ownership isn’t required.
+- Be explicit about ownership transfer:
+  - Take `String`/`Vec<T>` only when you intend to **own** and potentially store/move.
+  - Consider `Cow<'a, T>` for “borrow-or-own” APIs.
+- Minimize cloning:
+  - If you clone, make it obvious and justified (clone is a semantic choice, not a convenience).
+- Prefer simple lifetimes:
+  - Don’t introduce lifetime parameters unless the signature truly needs them.
+  - Prefer returning owned data over complex borrows unless performance requires it.
+- Keep data structures consistent with invariants:
+  - Encapsulate internal state; expose operations, not fields.
+  - Prefer newtypes to encode units/IDs and avoid mixing semantically different values.
+- Concurrency types:
+  - Use `Arc<T>` when shared ownership is required across threads/tasks.
+  - Avoid `Mutex`/`RwLock` unless you can articulate the contention model and lock ordering.
+

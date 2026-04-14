@@ -1,0 +1,22 @@
+---
+description: Rust unsafe code, performance, and profiling guidelines
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: unsafe & performance
+
+- Start with safe Rust; reach for `unsafe` only when:
+  - you can state the exact performance/FFI requirement, and
+  - you can precisely define and uphold the safety invariants.
+- If `unsafe` is necessary:
+  - Keep `unsafe` blocks **tiny** and local.
+  - Encapsulate them behind a safe API that enforces invariants.
+  - Prefer one well-audited unsafe module over scattered unsafe snippets.
+- Don’t micro-optimize blindly:
+  - Measure first (benchmarks, profiling) and optimize the hot path only.
+- Prefer algorithmic wins over clever tricks:
+  - Data layout, fewer allocations, better asymptotics beat minor instruction-level tweaks.
+- Avoid hidden O(n) behavior:
+  - Watch for repeated `to_string()`, `clone()`, `collect()`, and string concatenations in loops.
+

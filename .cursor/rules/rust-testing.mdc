@@ -1,0 +1,18 @@
+---
+description: Rust testing practices (unit, integration, and property tests)
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: testing
+
+- Prefer small unit tests close to the code for invariants and edge cases.
+- Use integration tests (`tests/`) for public API behavior and cross-module flows.
+- Make tests deterministic:
+  - Avoid time and randomness unless controlled (seeded RNG, fixed clocks).
+- Test failures should be diagnosable:
+  - Prefer assertions that include context; avoid “assert then unwrap panic” chains.
+- Use property testing when inputs are large/structured:
+  - Focus on invariants (roundtrips, ordering, idempotency, monotonicity).
+- Keep test-only helpers in `#[cfg(test)]` modules to avoid polluting production APIs.
+

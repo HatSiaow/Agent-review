@@ -1,0 +1,19 @@
+---
+description: Rust formatting, clippy, and lint hygiene
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: formatting & lints
+
+- Always keep code `rustfmt`-clean; don’t hand-align or fight formatting.
+- Treat `clippy` as a design review:
+  - Prefer fixing root causes over sprinkling `#[allow(...)]`.
+  - If you must `allow`, scope it narrowly and explain the trade-off in the smallest possible region.
+- Prefer explicitness where it improves correctness:
+  - Use `#[derive(Debug, Clone, PartialEq, Eq, Hash)]` when it matches semantics.
+  - Use `#[must_use]` for functions returning values that should not be ignored.
+- Avoid needless allocations:
+  - Prefer `&str`/`Cow<'_, str>` over `String` in APIs when callers can borrow.
+  - Prefer iterators and slices over collecting unless needed.
+

@@ -1,0 +1,23 @@
+---
+description: Rust error handling patterns (Result, context, and boundaries)
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: error handling
+
+- Model failure explicitly with `Result<T, E>`; avoid sentinel values.
+- Add context at **boundary crossings**:
+  - Convert low-level errors into domain errors at module/API boundaries.
+  - Preserve root causes (don’t stringify and lose structure).
+- Keep error types intentional:
+  - Libraries: prefer structured error enums with variants per failure category.
+  - Binaries: it’s fine to aggregate, but still keep actionable messages.
+- Prefer early returns and minimal nesting:
+  - Use `?` pervasively; reserve `match`/`if let` for branching logic.
+- Don’t use `unwrap()` / `expect()` in production paths:
+  - Use `expect()` only when the invariant is **provably true** and the message is diagnostic.
+  - In tests/prototypes, it’s acceptable but still be deliberate.
+- Think about **retryability** and **user-facing messages**:
+  - Separate internal diagnostic detail from what’s shown to end users.
+

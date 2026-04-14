@@ -1,0 +1,22 @@
+---
+description: Rust project structure & module layout best practices
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: project structure & module layout
+
+- Prefer a **flat, intentional module tree**. Don’t create deep `mod` nesting unless there is a real boundary (API surface, feature area, or domain).
+- Keep `lib.rs` and `main.rs` **thin**:
+  - `main.rs`: wiring + CLI/config + logging + top-level error handling.
+  - `lib.rs`: public API surface, re-exports, and module declarations.
+- Organize by **domain** more than by “types”:
+  - Prefer `user/`, `billing/`, `storage/` over `models/`, `services/`, `utils/` (except truly generic utilities).
+- Minimize `pub` exposure:
+  - Start with private-by-default; expose only what must be used outside the module.
+  - Prefer `pub(crate)` over `pub` for internal crates.
+- Use the module boundary to enforce invariants:
+  - Keep struct fields private and provide constructors / methods that validate invariants.
+- Avoid “God modules”:
+  - If a file grows, split by responsibility and keep cohesive APIs per module.
+
