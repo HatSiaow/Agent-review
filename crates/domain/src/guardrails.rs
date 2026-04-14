@@ -412,7 +412,7 @@ mod tests {
         let checks = default_checks();
         let text = "damn, here's a full refund: john@example.com +1-555-0000000";
         let result = evaluate_guardrails(text, &ctx(Platform::Google, 4), &checks);
-        assert_eq!(result.verdict, GuardrailVerdict::Warn);
+        assert_eq!(result.verdict, GuardrailVerdict::Fail);
         assert!(result.warnings.len() >= 3);
     }
 }
