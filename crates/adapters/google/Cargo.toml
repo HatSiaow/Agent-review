@@ -17,3 +17,6 @@ time.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+wiremock = "0.6"
