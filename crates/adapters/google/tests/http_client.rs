@@ -1,6 +1,16 @@
 use adapter_google::{GoogleConfig, GoogleReviewClient, HttpGoogleClient};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[derive(Debug)]
+struct MissingQueryParam(&'static str);
+
+impl wiremock::Match for MissingQueryParam {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let key = self.0;
+        !request.url.query_pairs().any(|(k, _)| k == key)
+    }
+}
 
 fn cfg_for(base: &str, token_url: &str) -> GoogleConfig {
     GoogleConfig {
@@ -31,6 +41,7 @@ async fn list_reviews_paginates_until_no_next_page_token() {
 
     Mock::given(method("GET"))
         .and(path("/v4/accounts/acc/locations/loc/reviews"))
+        .and(MissingQueryParam("pageToken"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "reviews": [{"reviewId":"r1","starRating":"FIVE","reviewer":{"displayName":"A"},"createTime":"2026-04-10T00:00:00Z"}],
             "nextPageToken":"t2"
@@ -38,9 +49,9 @@ async fn list_reviews_paginates_until_no_next_page_token() {
         .mount(&api)
         .await;
 
-    // Second page — match same path; token is in query string which we ignore for simplicity.
     Mock::given(method("GET"))
         .and(path("/v4/accounts/acc/locations/loc/reviews"))
+        .and(query_param("pageToken", "t2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "reviews": [{"reviewId":"r2","starRating":"FOUR","reviewer":{"displayName":"B"},"createTime":"2026-04-10T00:00:00Z"}]
         })))
