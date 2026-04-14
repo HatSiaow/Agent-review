@@ -7,7 +7,6 @@ use std::future::Future;
 use domain::Platform;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
 #[derive(Debug, Error)]
 pub enum LlmError {
     #[error("LLM request timed out after {0}ms")]
@@ -107,6 +106,7 @@ pub struct LlmConfig {
     pub max_retries: u32,
     pub timeout_ms: u64,
     pub monthly_cost_cap_usd: f64,
+    pub api_key: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -118,7 +118,145 @@ impl Default for LlmConfig {
             max_retries: 3,
             timeout_ms: 30_000,
             monthly_cost_cap_usd: 50.0,
+            api_key: None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AnthropicClient {
+    http: reqwest::Client,
+    config: LlmConfig,
+}
+
+impl AnthropicClient {
+    #[must_use]
+    pub fn new(config: LlmConfig) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            config,
+        }
+    }
+
+    fn model_for_tier(&self, tier: ModelTier) -> &str {
+        match tier {
+            ModelTier::Standard => &self.config.standard_model,
+            ModelTier::Escalation => &self.config.escalation_model,
+        }
+    }
+
+    fn key(&self) -> Result<&str, LlmError> {
+        self.config
+            .api_key
+            .as_deref()
+            .ok_or_else(|| LlmError::Other("ANTHROPIC_API_KEY not configured".into()))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicContent>,
+    model: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContent {
+    #[serde(rename = "type")]
+    ty: String,
+    text: Option<String>,
+}
+
+impl LlmClient for AnthropicClient {
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, LlmError> {
+        let start = std::time::Instant::now();
+        let max_retries = self.config.max_retries.max(1);
+
+        let prompt = format!(
+            "You are replying as the restaurant owner.\n\
+             Platform: {}\n\
+             Rating: {}\n\
+             Language: {}\n\
+             Restaurant: {}\n\
+             Context: {}\n\
+             Review: {}\n\
+             Hint: {}\n\
+             Write a reply under {} characters.",
+            request.platform,
+            request.review_rating,
+            request.review_language.clone().unwrap_or_else(|| "unknown".into()),
+            request.restaurant_name,
+            request.restaurant_context,
+            request.review_text.clone().unwrap_or_else(|| "(rating-only review)".into()),
+            request.hint.clone().unwrap_or_else(|| "(none)".into()),
+            request.max_chars
+        );
+
+        let url = format!("{}/v1/messages", self.config.api_base_url.trim_end_matches('/'));
+
+        for attempt in 0..max_retries {
+            let req = self
+                .http
+                .post(&url)
+                .header("x-api-key", self.key()?)
+                .header("anthropic-version", "2023-06-01")
+                .json(&serde_json::json!({
+                    "model": self.model_for_tier(request.model_tier),
+                    "max_tokens": 512,
+                    "messages": [
+                        { "role": "user", "content": prompt }
+                    ]
+                }));
+
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_millis(self.config.timeout_ms),
+                req.send(),
+            )
+            .await
+            .map_err(|_| LlmError::Timeout(self.config.timeout_ms))?
+            .map_err(|e| LlmError::Other(e.to_string()))?;
+
+            let status = resp.status().as_u16();
+            let text = resp.text().await.map_err(|e| LlmError::Other(e.to_string()))?;
+
+            if status >= 500 || status == 429 {
+                if attempt + 1 == max_retries {
+                    return Err(LlmError::ApiError {
+                        status,
+                        message: text,
+                    });
+                }
+                let backoff_ms = 500_u64.saturating_mul(2_u64.saturating_pow(attempt));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                continue;
+            }
+
+            if status >= 400 {
+                return Err(LlmError::ApiError {
+                    status,
+                    message: text,
+                });
+            }
+
+            let parsed: AnthropicResponse =
+                serde_json::from_str(&text).map_err(|e| LlmError::Other(e.to_string()))?;
+            let reply_text = parsed
+                .content
+                .into_iter()
+                .find(|c| c.ty == "text")
+                .and_then(|c| c.text)
+                .unwrap_or_default();
+
+            let latency_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            return Ok(GenerateResponse {
+                reply_text,
+                model_name: parsed.model,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                latency_ms,
+            });
+        }
+
+        Err(LlmError::Other("unreachable".into()))
     }
 }
 
