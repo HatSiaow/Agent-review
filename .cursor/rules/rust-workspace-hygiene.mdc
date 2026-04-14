@@ -1,0 +1,21 @@
+---
+description: Rust workspace hygiene (Cargo/CI checks, MSRV, and release discipline)
+globs: "{**/Cargo.toml,**/Cargo.lock,.github/workflows/**,**/.github/workflows/**}"
+alwaysApply: false
+---
+
+# Rust: workspace hygiene
+
+- Define and document MSRV (minimum supported Rust version) for libraries; avoid using newer features without intent.
+- CI should enforce the basics:
+  - `cargo fmt --check`
+  - `cargo clippy` (with a sensible lint baseline)
+  - `cargo test`
+- Keep features and defaults disciplined:
+  - Default features should be conservative for libraries; heavyweight integrations should be opt-in.
+- Dependency hygiene:
+  - Prefer fewer dependencies; periodically audit/upgrade and remove unused crates.
+- Lockfile policy:
+  - For applications/binaries, commit `Cargo.lock`.
+  - For libraries, follow your policy intentionally (don’t commit by accident).
+

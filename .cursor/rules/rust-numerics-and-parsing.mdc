@@ -1,0 +1,18 @@
+---
+description: Rust numeric correctness, overflow, and parsing practices
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: numerics & parsing
+
+- Be explicit about overflow behavior:
+  - Use `checked_*` / `saturating_*` / `wrapping_*` intentionally; don’t rely on debug-vs-release differences.
+- Prefer fallible conversions:
+  - Use `try_into()` when narrowing types; avoid lossy casts unless documented.
+- Parsing:
+  - Parse into DTOs, validate, then construct domain types.
+  - Avoid silent defaults that hide malformed input unless you are explicitly implementing forward-compat.
+- Use semantic numeric types when invariants matter:
+  - `NonZero*` types, newtypes for IDs/units, bounded types via constructors.
+

@@ -1,0 +1,20 @@
+---
+description: Rust FFI safety and boundary design
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: FFI
+
+- Keep the FFI boundary small and explicit:
+  - Use a thin `extern "C"` layer that converts into safe Rust types immediately.
+- Define ownership contracts precisely:
+  - Who allocates? Who frees? With which allocator? On which side?
+- Use correct representation:
+  - Use `#[repr(C)]` for structs crossing the boundary.
+  - Avoid Rust enums/collections across FFI unless using a stable ABI representation.
+- Validate all inbound data:
+  - Treat pointers/lengths as untrusted; check for null, bounds, and encoding.
+- Encapsulate `unsafe`:
+  - Make the public API safe and enforce invariants at the boundary.
+

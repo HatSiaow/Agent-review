@@ -1,0 +1,18 @@
+---
+description: Rust benchmarking and profiling guidance
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: benchmarking & profiling
+
+- Benchmark only after you have a hypothesis about what’s slow.
+- Prefer realistic benchmarks:
+  - Avoid microbenchmarks that ignore allocations, I/O, or cache effects unless that’s the point.
+- Control noise:
+  - Isolate setup from the measured section; avoid logging in hot loops.
+- Optimize the hot path:
+  - Measure → change → re-measure; avoid “clever” changes without evidence.
+- Watch for common accidental costs:
+  - repeated allocation/formatting in loops, extra clones, and unnecessary collects.
+

@@ -1,0 +1,19 @@
+---
+description: Rust security-focused authoring guidelines
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: security
+
+- Treat external input as untrusted:
+  - Validate early at boundaries; convert into validated domain types.
+- Avoid parsing into privileged/internal types directly:
+  - Prefer DTO → validate → domain conversion.
+- Minimize attack surface:
+  - Keep dependencies minimal; avoid enabling unnecessary default features.
+- Don’t leak secrets:
+  - Never log tokens/credentials/PII; avoid including sensitive data in `Debug` output for types that may be logged.
+- Prefer constant-time primitives when implementing security-sensitive comparisons or cryptography:
+  - Don’t roll your own crypto; use well-reviewed crates and keep interfaces narrow.
+

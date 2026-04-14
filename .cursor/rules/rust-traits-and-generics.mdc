@@ -1,0 +1,22 @@
+---
+description: Rust traits, generics, and abstraction trade-offs
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: traits & generics
+
+- Prefer the simplest abstraction that stays readable:
+  - Don’t introduce generics/traits until you need reuse across multiple concrete types.
+- Choose between generics and trait objects intentionally:
+  - **Generics (`T: Trait`)**: zero-cost, monomorphized, can increase compile times and code size.
+  - **Trait objects (`dyn Trait`)**: dynamic dispatch, smaller code, requires object safety, can simplify APIs.
+- Parameter style guidelines:
+  - Accept `impl Trait` in arguments for readability when you don’t need the type name.
+  - Use named generics when the same type appears multiple times or in return position.
+- Avoid overly-general “frameworky” APIs:
+  - If callers must write type annotations to use your function, the API is probably too generic.
+- Trait bounds:
+  - Prefer narrow bounds; don’t require `Clone + Send + Sync + 'static` unless you truly need each.
+  - Use `where` clauses for readability once bounds become non-trivial.
+

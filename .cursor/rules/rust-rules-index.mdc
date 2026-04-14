@@ -1,0 +1,28 @@
+---
+description: Index of Rust authoring rules for this repo
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust rules index
+
+When working in Rust, apply the relevant focused rules in `.cursor/rules/`:
+
+- `rust-project-structure.mdc`
+- `rust-formatting-and-lints.mdc`
+- `rust-errors.mdc`
+- `rust-ownership-and-apis.mdc`
+- `rust-traits-and-generics.mdc`
+- `rust-macros.mdc`
+- `rust-async.mdc`
+- `rust-testing.mdc`
+- `rust-serialization-and-serde.mdc`
+- `rust-logging-and-observability.mdc`
+- `rust-numerics-and-parsing.mdc`
+- `rust-security.mdc`
+- `rust-ffi.mdc`
+- `rust-unsafe-and-performance.mdc`
+- `rust-benchmarking.mdc`
+
+For project-level Rust concerns (Cargo/CI/MSRV), see `rust-workspace-hygiene.mdc`.
+

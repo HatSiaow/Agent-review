@@ -1,0 +1,19 @@
+---
+description: Rust macro best practices and when to avoid them
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: macros
+
+- Prefer functions, traits, and generics over macros for behavior.
+- Use macros when they provide unique value:
+  - reducing boilerplate that can’t be expressed well otherwise,
+  - building DSL-like call sites (sparingly),
+  - generating repetitive code with clear, audited expansion.
+- Keep macros simple:
+  - Favor `macro_rules!` for straightforward patterns.
+  - Keep expansions readable and debuggable (good error messages matter).
+- Avoid “clever” macros that hide control flow or allocations.
+- Document macro inputs/outputs and any hygiene constraints.
+
