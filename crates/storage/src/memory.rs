@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::repo::{Repository, RepositoryError, RepositoryResult};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InMemoryRepository(Arc<Mutex<State>>);
 
 #[derive(Debug, Default)]
@@ -24,12 +24,59 @@ struct State {
     audit_events: Vec<AuditEvent>,
     agent_runs: HashMap<Uuid, Vec<domain::AgentRun>>,
     idempotency_responses: HashMap<String, (u16, serde_json::Value, time::OffsetDateTime)>,
+    users: HashMap<Uuid, domain::User>,
+    users_auth: HashMap<Uuid, (String, Option<String>)>,
+    users_by_email: HashMap<String, Uuid>,
+    sessions: HashMap<Uuid, domain::Session>,
 }
 
 impl InMemoryRepository {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Default for InMemoryRepository {
+    fn default() -> Self {
+        // Seed a single owner user for dev/tests (single-restaurant scope).
+        //
+        // This keeps the API usable without requiring a provisioning flow in the
+        // in-memory repository. Postgres deployments should provision users explicitly.
+        let seed_user_id = Uuid::from_u128(1);
+        let email = "owner@example.com".to_string();
+        let created_at = OffsetDateTime::now_utc();
+        let user = domain::User {
+            id: seed_user_id,
+            email: email.clone(),
+            role: domain::UserRole::Owner,
+            created_at,
+        };
+
+        let password_hash = {
+            use argon2::password_hash::{PasswordHasher as _, SaltString};
+            use argon2::{Algorithm, Argon2, Params, Version};
+
+            let salt = SaltString::b64_encode(b"agent-review-seed-salt")
+                .expect("seed salt must be encodable");
+            let params = Params::new(65_536, 3, 1, None).expect("valid argon2 params");
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            argon2
+                .hash_password("password".as_bytes(), &salt)
+                .expect("hash seed password")
+                .to_string()
+        };
+
+        let mut state = State::default();
+        state
+            .users_by_email
+            .insert(email.to_ascii_lowercase(), seed_user_id);
+        state.users.insert(seed_user_id, user);
+        state
+            .users_auth
+            .insert(seed_user_id, (password_hash, None));
+
+        Self(Arc::new(Mutex::new(state)))
     }
 }
 
@@ -558,6 +605,78 @@ impl Repository for InMemoryRepository {
             serde_json::json!({}),
         ));
         Ok(out)
+    }
+
+    async fn get_user_auth_by_email(
+        &self,
+        email: &str,
+    ) -> RepositoryResult<Option<crate::repo::UserAuth>> {
+        let state = self.0.lock().await;
+        let key = email.trim().to_ascii_lowercase();
+        let Some(id) = state.users_by_email.get(&key).copied() else {
+            return Ok(None);
+        };
+        let Some(user) = state.users.get(&id).cloned() else {
+            return Ok(None);
+        };
+        let (password_hash, totp_secret) = state
+            .users_auth
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some(crate::repo::UserAuth {
+            user,
+            password_hash,
+            totp_secret,
+        }))
+    }
+
+    async fn get_user_by_id(&self, user_id: Uuid) -> RepositoryResult<Option<domain::User>> {
+        let state = self.0.lock().await;
+        Ok(state.users.get(&user_id).cloned())
+    }
+
+    async fn create_session(&self, session: domain::Session) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        state.sessions.insert(session.id, session);
+        Ok(())
+    }
+
+    async fn get_session_user(
+        &self,
+        session_id: Uuid,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<(domain::Session, domain::User)>> {
+        let state = self.0.lock().await;
+        let Some(session) = state.sessions.get(&session_id).cloned() else {
+            return Ok(None);
+        };
+        if now >= session.expires_at {
+            return Ok(None);
+        }
+        let Some(user) = state.users.get(&session.user_id).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some((session, user)))
+    }
+
+    async fn touch_session(
+        &self,
+        session_id: Uuid,
+        new_expires_at: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        let Some(s) = state.sessions.get_mut(&session_id) else {
+            return Ok(());
+        };
+        s.expires_at = new_expires_at;
+        Ok(())
+    }
+
+    async fn delete_session(&self, session_id: Uuid) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        state.sessions.remove(&session_id);
+        Ok(())
     }
 }
 

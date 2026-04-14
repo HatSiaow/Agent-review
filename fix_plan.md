@@ -4,8 +4,18 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
 
 - **P0 — Secure, correct human-in-the-loop posting (must-have before “real” use)**
   - **Implement real auth + sessions (owner/manager/viewer)** per `specs/coder/09-auth-and-secrets.md`, `specs/coder/06-human-in-the-loop-workflow.md`, `specs/coder/11-api-design.md`, `specs/coder/16-frontend-web-ui.md`.
-    - Remaining: login/session middleware + user identity derivation (stop accepting `user_id` in request bodies), role assignment UX/admin path, and end-to-end coverage.
-    - Code: `crates/api/src/lib.rs`, `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs}`.
+    - Resolved:
+      - Session-cookie auth is implemented (`POST /api/v1/auth/login`, `POST /api/v1/auth/logout`) and API identity now derives from the session cookie (no `x-user-id` / `x-user-role` header auth).
+      - In-memory repo seeds a dev/test owner user `owner@example.com` / `password`.
+      - Server wires `PgRepository` when `DATABASE_URL` is set (else falls back to in-memory).
+    - Remaining / follow-ups:
+      - Provisioning/admin UX for real users + role assignment in Postgres (no more “seed user” assumptions outside dev/tests).
+      - Harden session handling: `Secure` cookies in prod, explicit expiry/rotation/revocation strategy, and ensure logout clears both session + CSRF cookies.
+      - Add login rate limiting / lockouts (credential stuffing protection) and generic error responses.
+      - Implement password reset flow and storage (token issuance + expiry + one-time use).
+      - Implement optional TOTP enrollment/verification (2FA) and recovery codes.
+      - Ensure `APP_SESSION_SECRET` is always secret-backed (not ad-hoc env strings) and rotated safely (ties into secrets backend work).
+    - Code: `crates/api/src/{auth.rs,v1.rs,store.rs}`, `crates/storage/src/{repo.rs,memory.rs,pg.rs}`, `crates/server/src/main.rs`.
   - **Implement secrets backend + encryption-at-rest plumbing** (the `Secrets` trait + `EnvFileSecrets`(age) + cloud backends + envelope encryption helper) per `specs/coder/09-auth-and-secrets.md` and `specs/coder/15-security-privacy-compliance.md`.
     - Current gaps: no `Secrets` trait/implementations found in code; sensitive columns (e.g. `users.totp_secret`) are plaintext; adapters/LLM client read raw strings from env/config.
     - Code: new crate/module (likely `crates/common` or a new `crates/secrets` + `crates/encryption`), plus storage migrations updates.

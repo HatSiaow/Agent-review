@@ -9,7 +9,9 @@ workspace = true
 
 [dependencies]
 adapter-ubereats = { path = "../adapters/ubereats" }
+argon2 = { workspace = true }
 axum.workspace = true
+cookie = { workspace = true }
 domain = { path = "../domain" }
 storage = { path = "../storage" }
 hex.workspace = true
@@ -20,6 +22,7 @@ metrics-exporter-prometheus = "0.15"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

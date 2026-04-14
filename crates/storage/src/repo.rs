@@ -17,6 +17,17 @@ pub enum RepositoryError {
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
 
+/// Authentication-focused view of a user.
+///
+/// This is intentionally **not** part of the domain model because it contains
+/// sensitive material used for credential verification.
+#[derive(Debug, Clone)]
+pub struct UserAuth {
+    pub user: domain::User,
+    pub password_hash: String,
+    pub totp_secret: Option<String>,
+}
+
 /// Storage boundary for reviews + drafts.
 ///
 /// This abstraction lets the API and background workers operate against either
@@ -138,5 +149,38 @@ pub trait Repository: Send + Sync + 'static {
         draft_id: Uuid,
         error: String,
     ) -> RepositoryResult<ReplyDraft>;
+
+    // --- Auth / sessions ---
+
+    /// Fetch auth material by email (case-insensitive).
+    ///
+    /// Implementations must not log the password hash or TOTP secret.
+    async fn get_user_auth_by_email(&self, email: &str) -> RepositoryResult<Option<UserAuth>>;
+
+    /// Fetch a user record by id.
+    async fn get_user_by_id(&self, user_id: Uuid) -> RepositoryResult<Option<domain::User>>;
+
+    /// Create a new server-side session.
+    async fn create_session(
+        &self,
+        session: domain::Session,
+    ) -> RepositoryResult<()>;
+
+    /// Lookup a session and its user if still valid at `now`.
+    async fn get_session_user(
+        &self,
+        session_id: Uuid,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<(domain::Session, domain::User)>>;
+
+    /// Extend a session expiry ("sliding" sessions).
+    async fn touch_session(
+        &self,
+        session_id: Uuid,
+        new_expires_at: OffsetDateTime,
+    ) -> RepositoryResult<()>;
+
+    /// Revoke a session.
+    async fn delete_session(&self, session_id: Uuid) -> RepositoryResult<()>;
 }
 

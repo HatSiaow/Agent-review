@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::{fmt, fmt::Formatter};
 
 use domain::{ReplyDraft, Review};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::problem::ApiError;
@@ -67,6 +68,61 @@ impl Store {
 
     pub async fn ping(&self) -> Result<(), ApiError> {
         self.repo.ping().await.map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    // --- Auth / sessions ---
+
+    pub async fn get_user_auth_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<storage::UserAuth>, ApiError> {
+        self.repo
+            .get_user_auth_by_email(email)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn get_user_by_id(&self, user_id: Uuid) -> Result<Option<domain::User>, ApiError> {
+        self.repo
+            .get_user_by_id(user_id)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn create_session(&self, session: domain::Session) -> Result<(), ApiError> {
+        self.repo
+            .create_session(session)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn get_session_user(
+        &self,
+        session_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<Option<(domain::Session, domain::User)>, ApiError> {
+        self.repo
+            .get_session_user(session_id, now)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn touch_session(
+        &self,
+        session_id: Uuid,
+        new_expires_at: OffsetDateTime,
+    ) -> Result<(), ApiError> {
+        self.repo
+            .touch_session(session_id, new_expires_at)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn delete_session(&self, session_id: Uuid) -> Result<(), ApiError> {
+        self.repo
+            .delete_session(session_id)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
     }
 
     pub async fn get_review(&self, id: Uuid) -> Result<(Review, Option<ReplyDraft>), ApiError> {

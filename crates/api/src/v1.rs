@@ -3,6 +3,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use domain::ReplyDraft;
 use http::HeaderMap;
+use http::header;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -25,6 +26,8 @@ fn prometheus_handle() -> &'static metrics_exporter_prometheus::PrometheusHandle
 
 pub fn router() -> Router<Store> {
     Router::new()
+        .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
         .route("/reviews", get(list_reviews))
         .route("/reviews/:id", get(get_review))
         .route("/reviews/:id/skip", post(skip_review))
@@ -65,6 +68,112 @@ fn require_csrf(headers: &HeaderMap) -> Result<(), ApiError> {
         return Err(ApiError::Forbidden);
     }
     Ok(())
+}
+
+fn sign_session_cookie(session_id: Uuid) -> Result<String, ApiError> {
+    use hmac::Mac as _;
+    let secret = std::env::var("APP_SESSION_SECRET").map_err(|_| ApiError::ServiceUnavailable)?;
+    if secret.trim().len() < 32 {
+        return Err(ApiError::ServiceUnavailable);
+    }
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::ServiceUnavailable)?;
+    mac.update(session_id.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    Ok(format!("{session_id}.{}", hex::encode(sig)))
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    user: domain::User,
+}
+
+async fn login(
+    State(store): State<Store>,
+    Json(req): Json<LoginRequest>,
+) -> Result<(HeaderMap, Json<LoginResponse>), ApiError> {
+    use argon2::password_hash::PasswordHash;
+    use argon2::PasswordVerifier as _;
+
+    let email = req.email.trim();
+    let Some(auth) = store.get_user_auth_by_email(email).await? else {
+        return Err(ApiError::Unauthorized);
+    };
+
+    let parsed_hash = PasswordHash::new(&auth.password_hash).map_err(|_| ApiError::Unauthorized)?;
+    argon2::Argon2::default()
+        .verify_password(req.password.as_bytes(), &parsed_hash)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let now = OffsetDateTime::now_utc();
+    let session = domain::Session {
+        id: Uuid::new_v4(),
+        user_id: auth.user.id,
+        created_at: now,
+        expires_at: now + time::Duration::days(14),
+    };
+    store.create_session(session.clone()).await?;
+
+    let csrf_token = Uuid::new_v4().to_string();
+    let session_value = sign_session_cookie(session.id)?;
+
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SET_COOKIE,
+        format!(
+            "session={session_value}; Path=/; HttpOnly; SameSite=Lax"
+        )
+        .parse()
+        .map_err(|_| ApiError::ServiceUnavailable)?,
+    );
+    headers.append(
+        header::SET_COOKIE,
+        format!("csrf_token={csrf_token}; Path=/; SameSite=Lax")
+            .parse()
+            .map_err(|_| ApiError::ServiceUnavailable)?,
+    );
+
+    Ok((headers, Json(LoginResponse { user: auth.user })))
+}
+
+async fn logout(
+    State(store): State<Store>,
+    user: ActingUser,
+    headers: HeaderMap,
+) -> Result<HeaderMap, ApiError> {
+    require_csrf(&headers)?;
+    // Best-effort revoke if we can parse a session cookie.
+    let cookie = headers
+        .get(http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let session = cookie
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("session="))
+        .and_then(|v| v.split_once('.').map(|(sid, _)| sid.to_string()))
+        .and_then(|sid| Uuid::parse_str(&sid).ok());
+    if let Some(session_id) = session {
+        let _ = store.delete_session(session_id).await;
+    }
+
+    // Also emit an audit event in the future; for now logout is a session revoke only.
+    let _ = user; // keep extractor for auth enforcement
+
+    let mut out = HeaderMap::new();
+    out.append(
+        header::SET_COOKIE,
+        "session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+            .parse()
+            .map_err(|_| ApiError::ServiceUnavailable)?,
+    );
+    Ok(out)
 }
 
 async fn maybe_idempotent_success<T: serde::de::DeserializeOwned>(
@@ -138,7 +247,7 @@ pub struct ReviewListItem {
     pub active_draft: Option<domain::ReplyDraft>,
 }
 
-async fn list_reviews(State(store): State<Store>) -> Json<Vec<ReviewListItem>> {
+async fn list_reviews(State(store): State<Store>, _user: ActingUser) -> Json<Vec<ReviewListItem>> {
     let reviews = store.list_reviews().await;
     let out = reviews
         .into_iter()
@@ -159,6 +268,7 @@ pub struct ReviewWithDraft {
 async fn get_review(
     State(store): State<Store>,
     Path(id): Path<Uuid>,
+    _user: ActingUser,
 ) -> Result<Json<ReviewWithDraft>, ApiError> {
     let (review, active_draft) = store.get_review(id).await?;
     Ok(Json(ReviewWithDraft {
@@ -225,7 +335,7 @@ async fn regenerate_review(
 
 // --- Drafts ---
 
-async fn list_drafts(State(store): State<Store>) -> Json<Vec<ReplyDraft>> {
+async fn list_drafts(State(store): State<Store>, _user: ActingUser) -> Json<Vec<ReplyDraft>> {
     Json(store.list_drafts().await)
 }
 
@@ -353,15 +463,59 @@ mod tests {
     use time::macros::datetime;
     use tower::ServiceExt as _;
 
-    const TEST_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
+    fn ensure_session_secret() {
+        // Stable secret for tests; must be >= 32 chars.
+        std::env::set_var("APP_SESSION_SECRET", "test-test-test-test-test-test-test-test-1234");
+    }
 
-    fn auth_headers(builder: http::request::Builder, role: &str) -> http::request::Builder {
-        let csrf = "test-csrf";
+    fn oneshot(app: Router, req: Request<Body>) -> http::Response<axum::body::Body> {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { app.oneshot(req).await.unwrap() })
+    }
+
+    fn login_cookies(app: Router) -> (String, String) {
+        ensure_session_secret();
+        let body = serde_json::to_string(&json!({
+            "email": "owner@example.com",
+            "password": "password"
+        }))
+        .unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let set_cookie: Vec<String> = res
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
+
+        let session = set_cookie
+            .iter()
+            .filter_map(|s| s.split(';').next().map(str::trim))
+            .find_map(|s| s.strip_prefix("session=").map(str::to_string))
+            .expect("session cookie");
+        let csrf = set_cookie
+            .iter()
+            .filter_map(|c| c.split(';').next().map(str::trim))
+            .find_map(|s| s.strip_prefix("csrf_token=").map(str::to_string))
+            .expect("csrf cookie");
+        (session, csrf)
+    }
+
+    fn auth_headers(builder: http::request::Builder, session: &str, csrf: &str) -> http::request::Builder {
         builder
-            .header("x-user-id", TEST_USER_ID)
-            .header("x-user-role", role)
             .header("x-csrf-token", csrf)
-            .header(http::header::COOKIE, format!("csrf_token={csrf}"))
+            .header(http::header::COOKIE, format!("session={session}; csrf_token={csrf}"))
     }
 
     fn make_review_and_draft() -> (Uuid, Review, ReplyDraft) {
@@ -393,6 +547,7 @@ mod tests {
     }
 
     fn seeded_store() -> (Store, Uuid, Uuid) {
+        ensure_session_secret();
         let store = Store::new();
         let (review_id, review, draft) = make_review_and_draft();
         let draft_id = draft.id;
@@ -401,12 +556,6 @@ mod tests {
             .unwrap()
             .block_on(async { store.upsert_review_with_draft(review, draft).await });
         (store, review_id, draft_id)
-    }
-
-    fn oneshot(app: Router, req: Request<Body>) -> http::Response<axum::body::Body> {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async { app.oneshot(req).await.unwrap() })
     }
 
     #[test]
@@ -441,10 +590,12 @@ mod tests {
     fn list_reviews_returns_items() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
+        let (session, _csrf) = login_cookies(app.clone());
         let res = oneshot(
             app,
             Request::builder()
                 .uri("/api/v1/reviews")
+                .header(http::header::COOKIE, format!("session={session}"))
                 .body(Body::empty())
                 .unwrap(),
         );
@@ -455,10 +606,12 @@ mod tests {
     fn get_review_found() {
         let (store, review_id, _) = seeded_store();
         let app = build_router(store);
+        let (session, _csrf) = login_cookies(app.clone());
         let res = oneshot(
             app,
             Request::builder()
                 .uri(format!("/api/v1/reviews/{review_id}"))
+                .header(http::header::COOKIE, format!("session={session}"))
                 .body(Body::empty())
                 .unwrap(),
         );
@@ -469,11 +622,13 @@ mod tests {
     fn get_review_not_found() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
+        let (session, _csrf) = login_cookies(app.clone());
         let fake_id = Uuid::new_v4();
         let res = oneshot(
             app,
             Request::builder()
                 .uri(format!("/api/v1/reviews/{fake_id}"))
+                .header(http::header::COOKIE, format!("session={session}"))
                 .body(Body::empty())
                 .unwrap(),
         );
@@ -484,6 +639,7 @@ mod tests {
     fn skip_review_transitions() {
         let (store, review_id, _) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let res = oneshot(
             app,
             auth_headers(
@@ -491,7 +647,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/reviews/{review_id}/skip"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::empty())
             .unwrap(),
@@ -503,6 +660,7 @@ mod tests {
     fn approve_draft_returns_approved() {
         let (store, _, draft_id) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
             app,
@@ -511,7 +669,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/drafts/{draft_id}/approve"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -523,6 +682,7 @@ mod tests {
     fn approve_is_idempotent_with_idempotency_key() {
         let (store, _, draft_id) = seeded_store();
         let app = build_router(store.clone());
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({})).unwrap();
 
         let req = auth_headers(
@@ -531,7 +691,8 @@ mod tests {
                 .uri(format!("/api/v1/drafts/{draft_id}/approve"))
                 .header("content-type", "application/json")
                 .header("idempotency-key", "idem-1"),
-            "owner",
+            &session,
+            &csrf,
         )
         .body(Body::from(body.clone()))
         .unwrap();
@@ -547,7 +708,8 @@ mod tests {
                 .uri(format!("/api/v1/drafts/{draft_id}/approve"))
                 .header("content-type", "application/json")
                 .header("idempotency-key", "idem-1"),
-            "owner",
+            &session,
+            &csrf,
         )
         .body(Body::from(body))
         .unwrap();
@@ -559,6 +721,7 @@ mod tests {
     fn reject_draft_returns_rejected() {
         let (store, _, draft_id) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({"reason": "too_generic"})).unwrap();
         let res = oneshot(
             app,
@@ -567,7 +730,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/drafts/{draft_id}/reject"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -579,6 +743,7 @@ mod tests {
     fn double_reject_fails() {
         let (store, _, draft_id) = seeded_store();
         let app = build_router(store.clone());
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({"reason": "too_generic"})).unwrap();
 
         // First reject
@@ -589,7 +754,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/drafts/{draft_id}/reject"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body.clone()))
             .unwrap(),
@@ -605,7 +771,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/drafts/{draft_id}/reject"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -617,10 +784,12 @@ mod tests {
     fn list_drafts_endpoint() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
+        let (session, _csrf) = login_cookies(app.clone());
         let res = oneshot(
             app,
             Request::builder()
                 .uri("/api/v1/drafts")
+                .header(http::header::COOKIE, format!("session={session}"))
                 .body(Body::empty())
                 .unwrap(),
         );
@@ -630,9 +799,10 @@ mod tests {
     #[test]
     fn unskip_review_transitions() {
         let (store, review_id, _) = seeded_store();
+        let app = build_router(store.clone());
+        let (session, csrf) = login_cookies(app.clone());
 
         // First skip
-        let app = build_router(store.clone());
         let res = oneshot(
             app,
             auth_headers(
@@ -640,7 +810,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/reviews/{review_id}/skip"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::empty())
             .unwrap(),
@@ -656,7 +827,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/reviews/{review_id}/unskip"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::empty())
             .unwrap(),
@@ -668,6 +840,7 @@ mod tests {
     fn unskip_non_skipped_review_fails() {
         let (store, review_id, _) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let res = oneshot(
             app,
             auth_headers(
@@ -675,7 +848,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/reviews/{review_id}/unskip"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::empty())
             .unwrap(),
@@ -701,6 +875,7 @@ mod tests {
     fn approve_with_edit_text() {
         let (store, _, draft_id) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({"text": "Edited thanks!"})).unwrap();
         let res = oneshot(
             app,
@@ -709,7 +884,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/drafts/{draft_id}/approve"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -721,6 +897,7 @@ mod tests {
     fn approve_nonexistent_draft_returns_404() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let fake_id = Uuid::new_v4();
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
@@ -730,7 +907,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/drafts/{fake_id}/approve"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -742,6 +920,7 @@ mod tests {
     fn bulk_approve_five_star_no_warnings() {
         let (store, _, draft_id) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({"ids": [draft_id]})).unwrap();
         let res = oneshot(
             app,
@@ -750,7 +929,8 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/drafts/bulk-approve")
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -762,6 +942,7 @@ mod tests {
     fn bulk_approve_empty_ids_returns_ok() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({"ids": []})).unwrap();
         let res = oneshot(
             app,
@@ -770,7 +951,8 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/drafts/bulk-approve")
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -782,6 +964,7 @@ mod tests {
     fn bulk_approve_nonexistent_draft_returns_404() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let fake_id = Uuid::new_v4();
         let body = serde_json::to_string(&json!({"ids": [fake_id]})).unwrap();
         let res = oneshot(
@@ -791,7 +974,8 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/drafts/bulk-approve")
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -803,6 +987,7 @@ mod tests {
     fn reject_missing_reason_returns_422() {
         let (store, _, draft_id) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
             app,
@@ -811,7 +996,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/drafts/{draft_id}/reject"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -823,6 +1009,7 @@ mod tests {
     fn regenerate_review_from_new_status() {
         let (store, review_id, _) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let body = serde_json::to_string(&json!({"hint": "be warmer"})).unwrap();
         let res = oneshot(
             app,
@@ -831,7 +1018,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/reviews/{review_id}/regenerate"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -843,6 +1031,7 @@ mod tests {
     fn regenerate_nonexistent_review_returns_404() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
+        let (session, csrf) = login_cookies(app.clone());
         let fake_id = Uuid::new_v4();
         let body = serde_json::to_string(&json!({})).unwrap();
         let res = oneshot(
@@ -852,7 +1041,8 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/v1/reviews/{fake_id}/regenerate"))
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -863,9 +1053,10 @@ mod tests {
     #[test]
     fn undo_bulk_approve_endpoint_exists() {
         let (store, _, draft_id) = seeded_store();
+        let app = build_router(store.clone());
+        let (session, csrf) = login_cookies(app.clone());
 
         // Bulk approve first.
-        let app = build_router(store.clone());
         let body = serde_json::to_string(&json!({"ids": [draft_id]})).unwrap();
         let res = oneshot(
             app,
@@ -874,7 +1065,8 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/drafts/bulk-approve")
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body))
             .unwrap(),
@@ -891,7 +1083,8 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/drafts/bulk-approve/undo")
                     .header("content-type", "application/json"),
-                "owner",
+                &session,
+                &csrf,
             )
             .body(Body::from(body2))
             .unwrap(),

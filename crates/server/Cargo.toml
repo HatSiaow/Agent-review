@@ -19,6 +19,7 @@ domain = { path = "../domain" }
 llm-client = { path = "../llm_client" }
 notifier = { path = "../notifier" }
 poster = { path = "../poster" }
+storage = { path = "../storage" }
 serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true

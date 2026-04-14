@@ -9,7 +9,15 @@ async fn main() -> anyhow::Result<()> {
 
     let bind_addr = std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
 
-    let store = api::Store::new();
+    let store = if let Some(cfg) = storage::PgRepositoryConfig::from_env() {
+        let repo = storage::PgRepository::connect(&cfg)
+            .await
+            .context("connect db")?;
+        repo.migrate().await.context("migrate db")?;
+        api::Store::from_repo(std::sync::Arc::new(repo))
+    } else {
+        api::Store::new()
+    };
     let app = api::router(store.clone());
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)

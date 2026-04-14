@@ -1135,5 +1135,198 @@ impl Repository for PgRepository {
         .await?;
         Ok(draft)
     }
+
+    async fn get_user_auth_by_email(
+        &self,
+        email: &str,
+    ) -> RepositoryResult<Option<crate::repo::UserAuth>> {
+        #[derive(Debug, Clone, sqlx::FromRow)]
+        struct UserRow {
+            id: Uuid,
+            email: String,
+            password_hash: String,
+            role: String,
+            totp_secret: Option<String>,
+            created_at: OffsetDateTime,
+        }
+
+        let row: Option<UserRow> = sqlx::query_as(
+            r"
+            select id, email, password_hash, role, totp_secret, created_at
+            from users
+            where lower(email) = lower($1)
+            ",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let role = match row.role.as_str() {
+            "owner" => domain::UserRole::Owner,
+            "manager" => domain::UserRole::Manager,
+            "viewer" => domain::UserRole::Viewer,
+            _ => return Err(RepositoryError::Storage("invalid user role".into())),
+        };
+
+        Ok(Some(crate::repo::UserAuth {
+            user: domain::User {
+                id: row.id,
+                email: row.email,
+                role,
+                created_at: row.created_at,
+            },
+            password_hash: row.password_hash,
+            totp_secret: row.totp_secret,
+        }))
+    }
+
+    async fn get_user_by_id(&self, user_id: Uuid) -> RepositoryResult<Option<domain::User>> {
+        #[derive(Debug, Clone, sqlx::FromRow)]
+        struct UserRow {
+            id: Uuid,
+            email: String,
+            role: String,
+            created_at: OffsetDateTime,
+        }
+
+        let row: Option<UserRow> = sqlx::query_as(
+            r"
+            select id, email, role, created_at
+            from users
+            where id = $1
+            ",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let role = match row.role.as_str() {
+            "owner" => domain::UserRole::Owner,
+            "manager" => domain::UserRole::Manager,
+            "viewer" => domain::UserRole::Viewer,
+            _ => return Err(RepositoryError::Storage("invalid user role".into())),
+        };
+        Ok(Some(domain::User {
+            id: row.id,
+            email: row.email,
+            role,
+            created_at: row.created_at,
+        }))
+    }
+
+    async fn create_session(&self, session: domain::Session) -> RepositoryResult<()> {
+        sqlx::query(
+            r"
+            insert into sessions (id, user_id, created_at, expires_at)
+            values ($1, $2, $3, $4)
+            on conflict (id) do nothing
+            ",
+        )
+        .bind(session.id)
+        .bind(session.user_id)
+        .bind(session.created_at)
+        .bind(session.expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_session_user(
+        &self,
+        session_id: Uuid,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<(domain::Session, domain::User)>> {
+        #[derive(Debug, Clone, sqlx::FromRow)]
+        struct SessionUserRow {
+            session_id: Uuid,
+            session_user_id: Uuid,
+            session_created_at: OffsetDateTime,
+            session_expires_at: OffsetDateTime,
+            user_email: String,
+            user_role: String,
+            user_created_at: OffsetDateTime,
+        }
+
+        let row: Option<SessionUserRow> = sqlx::query_as(
+            r"
+            select
+              s.id as session_id,
+              s.user_id as session_user_id,
+              s.created_at as session_created_at,
+              s.expires_at as session_expires_at,
+              u.email as user_email,
+              u.role as user_role,
+              u.created_at as user_created_at
+            from sessions s
+            join users u on u.id = s.user_id
+            where s.id = $1
+              and s.expires_at > $2
+            ",
+        )
+        .bind(session_id)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let role = match row.user_role.as_str() {
+            "owner" => domain::UserRole::Owner,
+            "manager" => domain::UserRole::Manager,
+            "viewer" => domain::UserRole::Viewer,
+            _ => return Err(RepositoryError::Storage("invalid user role".into())),
+        };
+
+        Ok(Some((
+            domain::Session {
+                id: row.session_id,
+                user_id: row.session_user_id,
+                created_at: row.session_created_at,
+                expires_at: row.session_expires_at,
+            },
+            domain::User {
+                id: row.session_user_id,
+                email: row.user_email,
+                role,
+                created_at: row.user_created_at,
+            },
+        )))
+    }
+
+    async fn touch_session(
+        &self,
+        session_id: Uuid,
+        new_expires_at: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        sqlx::query("update sessions set expires_at = $1 where id = $2")
+            .bind(new_expires_at)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_session(&self, session_id: Uuid) -> RepositoryResult<()> {
+        sqlx::query("delete from sessions where id = $1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
 }
 

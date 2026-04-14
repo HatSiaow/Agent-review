@@ -110,6 +110,28 @@ impl fmt::Display for UserRole {
     }
 }
 
+/// An application user (single-restaurant scope).
+///
+/// This is the canonical identity used for authorization decisions across the API and UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub id: Uuid,
+    pub email: String,
+    pub role: UserRole,
+    pub created_at: OffsetDateTime,
+}
+
+/// A server-side session referenced by an HttpOnly cookie.
+///
+/// Sessions are stored in the database to support revocation and sliding expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
 /// Notification event categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

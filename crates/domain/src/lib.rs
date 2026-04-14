@@ -16,7 +16,7 @@ pub use crate::guardrails::{
 };
 pub use crate::model::{
     AgentRun, Generator, NotificationType, Platform, RejectionReason, ReplyDraft, Review, ReviewAuthor,
-    ReviewStatus, UserRole,
+    ReviewStatus, Session, User, UserRole,
 };
 pub use crate::review_fsm::{InvalidReviewTransition, ReviewEvent, ReviewFsm};
 pub use crate::validation::ValidationError;
