@@ -20,7 +20,7 @@ pub type RepositoryResult<T> = Result<T, RepositoryError>;
 ///
 /// This abstraction lets the API and background workers operate against either
 /// an in-memory store (tests/dev) or Postgres (production).
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub trait Repository: Send + Sync + 'static {
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>>;
     async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)>;
