@@ -163,4 +163,68 @@ mod tests {
         assert!(resp.reply_text.contains("be more empathetic"));
         assert_eq!(resp.model_name, "in-memory-escalation");
     }
+
+    #[test]
+    fn llm_config_defaults() {
+        let config = LlmConfig::default();
+        assert!(config.api_base_url.contains("anthropic"));
+        assert_eq!(config.standard_model, "claude-sonnet-4-6");
+        assert_eq!(config.escalation_model, "claude-opus-4-6");
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.timeout_ms, 30_000);
+        assert!(config.monthly_cost_cap_usd > 0.0);
+    }
+
+    #[test]
+    fn model_tier_serde_round_trip() {
+        let tier = ModelTier::Escalation;
+        let json = serde_json::to_string(&tier).unwrap();
+        let decoded: ModelTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, ModelTier::Escalation);
+    }
+
+    #[test]
+    fn generate_request_serde() {
+        let req = GenerateRequest {
+            review_text: Some("Nice!".into()),
+            review_rating: 5,
+            review_language: Some("en".into()),
+            platform: Platform::Google,
+            restaurant_name: "Chez Luca".into(),
+            restaurant_context: "Italian".into(),
+            model_tier: ModelTier::Standard,
+            max_chars: 1000,
+            hint: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: GenerateRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.review_rating, 5);
+    }
+
+    #[test]
+    fn llm_error_display() {
+        assert!(LlmError::Timeout(5000).to_string().contains("5000"));
+        assert!(LlmError::CostCapExceeded.to_string().contains("cost cap"));
+        assert!(LlmError::Other("oops".into()).to_string().contains("oops"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_llm_custom_reply() {
+        let llm = InMemoryLlm {
+            default_reply: "Custom reply from our team.".into(),
+        };
+        let req = GenerateRequest {
+            review_text: Some("Food was great".into()),
+            review_rating: 5,
+            review_language: Some("en".into()),
+            platform: Platform::Google,
+            restaurant_name: "Test".into(),
+            restaurant_context: String::new(),
+            model_tier: ModelTier::Standard,
+            max_chars: 1000,
+            hint: None,
+        };
+        let resp = llm.generate(req).await.unwrap();
+        assert_eq!(resp.reply_text, "Custom reply from our team.");
+    }
 }

@@ -246,4 +246,58 @@ mod tests {
         let r2 = make_review("r1", 5);
         assert!(!has_content_changed(&r1, &r2));
     }
+
+    #[test]
+    fn has_content_changed_rating_change() {
+        let r1 = make_review("r1", 5);
+        let r2 = make_review("r1", 4);
+        assert!(has_content_changed(&r1, &r2));
+    }
+
+    #[test]
+    fn has_content_changed_newer_updated_at() {
+        let r1 = make_review("r1", 5);
+        let mut r2 = make_review("r1", 5);
+        r2.updated_at = datetime!(2026-04-11 12:00:00 UTC);
+        assert!(has_content_changed(&r1, &r2));
+    }
+
+    #[test]
+    fn dedup_key_returns_platform_and_id() {
+        let r = make_review("rev-abc", 3);
+        let (platform, source_id) = dedup_key(&r);
+        assert_eq!(platform, Platform::Google);
+        assert_eq!(source_id, "rev-abc");
+    }
+
+    #[test]
+    fn empty_index_is_empty() {
+        let index = InMemoryDedupIndex::new();
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn validation_failure_on_empty_source_id() {
+        let mut index = InMemoryDedupIndex::new();
+        let mut review = make_review("", 5);
+        review.source_review_id = String::new();
+        let err = index.ingest(review).unwrap_err();
+        assert!(matches!(err, IngestionError::ValidationFailed { .. }));
+    }
+
+    #[test]
+    fn ingestion_error_display() {
+        let err = IngestionError::Storage("connection refused".into());
+        assert!(err.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn sync_state_new_has_no_data() {
+        let state = SyncState::new(Platform::Ubereats);
+        assert_eq!(state.platform, Platform::Ubereats);
+        assert!(state.last_seen_update_time.is_none());
+        assert!(state.last_run_at.is_none());
+        assert!(state.last_error.is_none());
+    }
 }

@@ -1,6 +1,6 @@
 //! Webhook endpoints for platform push events.
 
-use adapter_ubereats::verify_webhook_signature;
+use adapter_ubereats::{normalize_ubereats_review, verify_webhook_signature};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -11,7 +11,6 @@ use crate::Store;
 
 #[derive(Debug, Clone)]
 struct WebhookState {
-    #[allow(dead_code)]
     store: Store,
     ubereats_webhook_secret: Option<String>,
 }
@@ -19,7 +18,7 @@ struct WebhookState {
 pub fn router(store: Store) -> Router {
     let state = WebhookState {
         store,
-        ubereats_webhook_secret: None,
+        ubereats_webhook_secret: std::env::var("UBEREATS_WEBHOOK_SECRET").ok(),
     };
 
     Router::new()
@@ -32,7 +31,6 @@ async fn ubereats_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    // Verify HMAC signature if secret is configured
     if let Some(ref secret) = state.ubereats_webhook_secret {
         let signature = headers
             .get("x-uber-signature")
@@ -45,18 +43,37 @@ async fn ubereats_webhook(
         }
     }
 
-    // Parse and enqueue — for now just acknowledge
-    match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(payload) => {
-            let event_type = payload["event_type"].as_str().unwrap_or("unknown");
-            tracing::info!(event_type, "received UberEats webhook");
-            StatusCode::OK
-        }
+    let payload = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "failed to parse UberEats webhook body");
-            StatusCode::BAD_REQUEST
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    let event_type = payload["event_type"].as_str().unwrap_or("unknown");
+    tracing::info!(event_type, "received UberEats webhook");
+
+    if event_type == "store.review_created" {
+        let review_data = if payload.get("review").is_some() {
+            &payload["review"]
+        } else {
+            &payload
+        };
+
+        match normalize_ubereats_review(review_data) {
+            Ok(review) => {
+                let review_id = review.id;
+                state.store.ingest_review(review).await;
+                tracing::info!(%review_id, "ingested UberEats review from webhook");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to normalize UberEats review from webhook");
+            }
         }
     }
+
+    StatusCode::OK
 }
 
 #[cfg(test)]
@@ -110,5 +127,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ubereats_webhook_ingests_review_created_event() {
+        let store = Store::new();
+        let app = build_router(store.clone());
+
+        let body = serde_json::json!({
+            "event_type": "store.review_created",
+            "review": {
+                "review_uuid": "ue-webhook-test-1",
+                "store_uuid": "store-abc",
+                "eater": { "first_name": "Marco" },
+                "rating": { "overall": 4 },
+                "comment": { "text": "Good food", "language": "en" },
+                "created_at": "2026-04-10T14:30:00Z"
+            }
+        });
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/ubereats")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let reviews = store.list_reviews().await;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].0.source_review_id, "ue-webhook-test-1");
+    }
+
+    #[tokio::test]
+    async fn ubereats_webhook_non_review_event_ok() {
+        let store = Store::new();
+        let app = build_router(store.clone());
+
+        let body = serde_json::json!({
+            "event_type": "store.order_created",
+            "order_uuid": "order-1"
+        });
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/ubereats")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let reviews = store.list_reviews().await;
+        assert!(reviews.is_empty());
     }
 }

@@ -22,6 +22,7 @@ pub fn router(store: Store) -> Router {
         .route("/reviews/:id", get(get_review))
         .route("/reviews/:id/skip", post(skip_review))
         .route("/reviews/:id/unskip", post(unskip_review))
+        .route("/reviews/:id/regenerate", post(regenerate_review))
         .route("/drafts", get(list_drafts))
         .route("/drafts/:id/approve", post(approve_draft))
         .route("/drafts/:id/reject", post(reject_draft))
@@ -36,8 +37,13 @@ pub async fn healthz() -> &'static str {
 }
 
 pub async fn readyz() -> &'static str {
-    // In a real deployment this would check DB + secrets reachability
     "ok"
+}
+
+pub async fn metrics() -> &'static str {
+    // Placeholder — a real deployment would integrate with
+    // `metrics-exporter-prometheus` and return the scrape output.
+    ""
 }
 
 // --- Reviews ---
@@ -91,6 +97,34 @@ async fn unskip_review(
 ) -> Result<Json<domain::Review>, ApiError> {
     let review = state.store.unskip_review(id).await?;
     Ok(Json(review))
+}
+
+// --- Regenerate ---
+
+#[derive(Debug, Deserialize)]
+struct RegenerateRequest {
+    #[serde(default)]
+    hint: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegenerateResponse {
+    review_id: Uuid,
+    status: domain::ReviewStatus,
+    hint: Option<String>,
+}
+
+async fn regenerate_review(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RegenerateRequest>,
+) -> Result<Json<RegenerateResponse>, ApiError> {
+    let review = state.store.transition_review_to_drafting(id).await?;
+    Ok(Json(RegenerateResponse {
+        review_id: review.id,
+        status: review.status,
+        hint: req.hint,
+    }))
 }
 
 // --- Drafts ---
@@ -385,5 +419,153 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn unskip_review_transitions() {
+        let (store, review_id, _) = seeded_store();
+
+        // First skip
+        let app = build_router(store.clone());
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/reviews/{review_id}/skip"))
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Then unskip
+        let app2 = build_router(store);
+        let res2 = oneshot(
+            app2,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/reviews/{review_id}/unskip"))
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        assert_eq!(res2.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn unskip_non_skipped_review_fails() {
+        let (store, review_id, _) = seeded_store();
+        let app = build_router(store);
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/reviews/{review_id}/unskip"))
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn metrics_returns_200() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let res = oneshot(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn approve_with_edit_text() {
+        let (store, _, draft_id) = seeded_store();
+        let app = build_router(store);
+        let body = serde_json::to_string(&json!({"text": "Edited thanks!"})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/drafts/{draft_id}/approve"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn approve_nonexistent_draft_returns_404() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let fake_id = Uuid::new_v4();
+        let body = serde_json::to_string(&json!({})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/drafts/{fake_id}/approve"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn bulk_approve_five_star_no_warnings() {
+        let (store, _, draft_id) = seeded_store();
+        let app = build_router(store);
+        let body = serde_json::to_string(&json!({"ids": [draft_id]})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/drafts/bulk-approve")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn regenerate_review_from_new_status() {
+        let (store, review_id, _) = seeded_store();
+        let app = build_router(store);
+        let body = serde_json::to_string(&json!({"hint": "be warmer"})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/reviews/{review_id}/regenerate"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn regenerate_nonexistent_review_returns_404() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let fake_id = Uuid::new_v4();
+        let body = serde_json::to_string(&json!({})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/reviews/{fake_id}/regenerate"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }

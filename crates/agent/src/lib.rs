@@ -91,7 +91,13 @@ pub fn classify_flags(review: &Review) -> Vec<String> {
     flags
 }
 
+const MAX_GUARDRAIL_RETRIES: u8 = 1;
+
 /// Run the agent for a single review, producing a draft.
+///
+/// If guardrails fail on the first attempt, the agent retries once with a
+/// corrective system note appended to the hint. If the retry also fails,
+/// the draft is stored with guardrail warnings for human review.
 pub async fn run_agent<C: LlmClient>(
     llm: &C,
     config: &AgentConfig,
@@ -100,20 +106,7 @@ pub async fn run_agent<C: LlmClient>(
 ) -> Result<AgentRunResult, AgentError> {
     let model_tier = select_model_tier(review);
     let char_limit = review.reply_char_limit();
-
-    let request = GenerateRequest {
-        review_text: review.body_text.clone(),
-        review_rating: review.rating,
-        review_language: review.body_language.clone(),
-        platform: review.platform,
-        restaurant_name: config.restaurant_name.clone(),
-        restaurant_context: config.restaurant_context.clone(),
-        model_tier,
-        max_chars: char_limit,
-        hint,
-    };
-
-    let response: GenerateResponse = llm.generate(request).await?;
+    let checks = domain::guardrails::default_checks();
 
     let guardrail_ctx = GuardrailContext {
         platform: review.platform,
@@ -122,39 +115,88 @@ pub async fn run_agent<C: LlmClient>(
         char_limit,
     };
 
-    let checks = domain::guardrails::default_checks();
-    let guardrail_result = domain::guardrails::evaluate_guardrails(
-        &response.reply_text,
-        &guardrail_ctx,
-        &checks,
-    );
+    let mut total_prompt_tokens = 0u32;
+    let mut total_completion_tokens = 0u32;
+    let mut total_latency_ms = 0u64;
+    let mut last_model_name = String::new();
+    let mut attempts = 0u8;
+    let mut current_hint = hint;
 
-    let flags = classify_flags(review);
-    let warnings: Vec<String> = guardrail_result
-        .warnings
-        .iter()
-        .map(|w| w.rule.clone())
-        .collect();
+    loop {
+        let request = GenerateRequest {
+            review_text: review.body_text.clone(),
+            review_rating: review.rating,
+            review_language: review.body_language.clone(),
+            platform: review.platform,
+            restaurant_name: config.restaurant_name.clone(),
+            restaurant_context: config.restaurant_context.clone(),
+            model_tier,
+            max_chars: char_limit,
+            hint: current_hint.clone(),
+        };
 
-    let mut draft = ReplyDraft::new_pending(
-        review.id,
-        response.reply_text,
-        review.body_language.clone().unwrap_or_else(|| "en".into()),
-    );
-    draft.model_name = Some(response.model_name.clone());
-    draft.generated_by = Generator::AgentLlm;
-    draft.guardrail_warnings = warnings;
-    draft.flags = flags;
+        let response: GenerateResponse = llm.generate(request).await?;
 
-    Ok(AgentRunResult {
-        draft,
-        model_name: response.model_name,
-        prompt_tokens: response.prompt_tokens,
-        completion_tokens: response.completion_tokens,
-        latency_ms: response.latency_ms,
-        tool_calls: 0,
-        guardrail_result,
-    })
+        total_prompt_tokens = total_prompt_tokens.saturating_add(response.prompt_tokens);
+        total_completion_tokens = total_completion_tokens.saturating_add(response.completion_tokens);
+        total_latency_ms = total_latency_ms.saturating_add(response.latency_ms);
+        last_model_name.clone_from(&response.model_name);
+
+        let guardrail_result = domain::guardrails::evaluate_guardrails(
+            &response.reply_text,
+            &guardrail_ctx,
+            &checks,
+        );
+
+        let has_warnings = !guardrail_result.warnings.is_empty();
+
+        if !has_warnings || attempts >= MAX_GUARDRAIL_RETRIES {
+            let flags = classify_flags(review);
+            let warnings: Vec<String> = guardrail_result
+                .warnings
+                .iter()
+                .map(|w| w.rule.clone())
+                .collect();
+
+            let mut draft = ReplyDraft::new_pending(
+                review.id,
+                response.reply_text,
+                review.body_language.clone().unwrap_or_else(|| "en".into()),
+            );
+            draft.model_name = Some(response.model_name);
+            draft.generated_by = Generator::AgentLlm;
+            draft.guardrail_warnings = warnings;
+            draft.flags = flags;
+            if has_warnings {
+                draft.flags.push("guardrail_warning".into());
+            }
+
+            return Ok(AgentRunResult {
+                draft,
+                model_name: last_model_name,
+                prompt_tokens: total_prompt_tokens,
+                completion_tokens: total_completion_tokens,
+                latency_ms: total_latency_ms,
+                tool_calls: 0,
+                guardrail_result,
+            });
+        }
+
+        let violation_rules: Vec<String> = guardrail_result
+            .warnings
+            .iter()
+            .map(|w| format!("{}: {}", w.rule, w.message))
+            .collect();
+        let corrective_note = format!(
+            "Your previous reply violated these guardrails: {}. Please fix these issues.",
+            violation_rules.join("; ")
+        );
+        current_hint = Some(match current_hint {
+            Some(h) => format!("{h}. {corrective_note}"),
+            None => corrective_note,
+        });
+        attempts += 1;
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +297,62 @@ mod tests {
     fn sensitive_keywords_detected() {
         assert!(contains_sensitive_keywords(&review(4, Some("I got food poisoning here"))));
         assert!(contains_sensitive_keywords(&review(3, Some("My allergy was ignored"))));
+    }
+
+    #[test]
+    fn no_sensitive_keywords_when_no_body() {
+        assert!(!contains_sensitive_keywords(&review(5, None)));
+    }
+
+    #[test]
+    fn classify_flags_sensitive_keyword_high_rating() {
+        let flags = classify_flags(&review(5, Some("I had an allergic reaction")));
+        assert!(flags.contains(&"sensitive".into()));
+    }
+
+    #[tokio::test]
+    async fn run_agent_for_rating_only_review() {
+        let llm = InMemoryLlm::default();
+        let config = AgentConfig::default();
+        let r = review(5, None);
+        let result = run_agent(&llm, &config, &r, None).await.unwrap();
+        assert_eq!(result.draft.review_id, r.id);
+        assert_eq!(result.draft.language, "en");
+    }
+
+    #[tokio::test]
+    async fn run_agent_low_rating_gets_sensitive_flag() {
+        let llm = InMemoryLlm::default();
+        let config = AgentConfig::default();
+        let r = review(1, Some("Terrible service"));
+        let result = run_agent(&llm, &config, &r, None).await.unwrap();
+        assert!(result.draft.flags.contains(&"sensitive".into()));
+        assert_eq!(result.model_name, "in-memory-escalation");
+    }
+
+    #[tokio::test]
+    async fn run_agent_three_star_gets_needs_attention() {
+        let llm = InMemoryLlm::default();
+        let config = AgentConfig::default();
+        let r = review(3, Some("Average experience"));
+        let result = run_agent(&llm, &config, &r, None).await.unwrap();
+        assert!(result.draft.flags.contains(&"needs_attention".into()));
+    }
+
+    #[tokio::test]
+    async fn run_agent_ubereats_platform() {
+        let llm = InMemoryLlm::default();
+        let config = AgentConfig::default();
+        let mut r = review(5, Some("Great food!"));
+        r.platform = Platform::Ubereats;
+        let result = run_agent(&llm, &config, &r, None).await.unwrap();
+        assert_eq!(result.draft.review_id, r.id);
+    }
+
+    #[test]
+    fn agent_config_defaults() {
+        let config = AgentConfig::default();
+        assert_eq!(config.restaurant_name, "Chez Luca");
+        assert!(!config.restaurant_context.is_empty());
     }
 }

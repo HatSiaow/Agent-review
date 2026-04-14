@@ -142,6 +142,49 @@ pub trait NotificationSender: Send + Sync {
     ) -> impl Future<Output = Result<(), NotifierError>> + Send;
 }
 
+/// Parameters for dispatching a notification.
+#[derive(Debug, Clone)]
+pub struct DispatchParams<'a> {
+    pub notification_type: NotificationType,
+    pub recipient: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub entity_id: Option<Uuid>,
+    pub quiet_hours: Option<&'a QuietHours>,
+    pub current_hour: u8,
+}
+
+/// Dispatch a notification across all appropriate channels, respecting quiet
+/// hours and channel suppression rules.
+pub async fn dispatch_notification<S: NotificationSender>(
+    sender: &S,
+    params: &DispatchParams<'_>,
+) -> Vec<Result<(), NotifierError>> {
+    let channels = channels_for_type(params.notification_type);
+    let mut results = Vec::with_capacity(channels.len());
+
+    for channel in channels {
+        if let Some(qh) = params.quiet_hours {
+            if qh.should_suppress(params.notification_type, channel, params.current_hour) {
+                continue;
+            }
+        }
+
+        let mut notif = Notification::new(
+            params.notification_type,
+            channel,
+            params.recipient,
+            params.subject,
+            params.body,
+        );
+        notif.entity_id = params.entity_id;
+
+        results.push(sender.send(&notif).await);
+    }
+
+    results
+}
+
 /// In-memory sender for testing.
 #[derive(Debug, Default)]
 pub struct InMemoryNotificationSender {
@@ -256,5 +299,136 @@ mod tests {
         );
         sender.send(&notif).await.unwrap();
         assert_eq!(sender.sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notification_new_sets_fields() {
+        let notif = Notification::new(
+            NotificationType::PostFailed,
+            Channel::Push,
+            "owner@example.com",
+            "Post failed",
+            "Reply could not be posted.",
+        );
+        assert_eq!(notif.notification_type, NotificationType::PostFailed);
+        assert_eq!(notif.channel, Channel::Push);
+        assert_eq!(notif.recipient, "owner@example.com");
+        assert!(notif.entity_id.is_none());
+    }
+
+    #[test]
+    fn sla_escalation_uses_sms() {
+        let channels = channels_for_type(NotificationType::SlaEscalation);
+        assert!(channels.contains(&Channel::Sms));
+    }
+
+    #[test]
+    fn post_failed_no_sms() {
+        let channels = channels_for_type(NotificationType::PostFailed);
+        assert!(!channels.contains(&Channel::Sms));
+    }
+
+    #[test]
+    fn drift_detected_email_only() {
+        let channels = channels_for_type(NotificationType::DriftDetected);
+        assert_eq!(channels, vec![Channel::Email]);
+    }
+
+    #[test]
+    fn sla_breach_channels() {
+        let channels = channels_for_type(NotificationType::SlaBreach);
+        assert!(channels.contains(&Channel::Email));
+        assert!(channels.contains(&Channel::Push));
+        assert!(!channels.contains(&Channel::Sms));
+    }
+
+    #[test]
+    fn push_suppressed_in_quiet() {
+        let qh = QuietHours {
+            start_hour: 22,
+            end_hour: 8,
+        };
+        assert!(qh.should_suppress(NotificationType::DraftReady, Channel::Push, 23));
+    }
+
+    #[test]
+    fn sms_for_sla_escalation_not_suppressed() {
+        let qh = QuietHours {
+            start_hour: 22,
+            end_hour: 8,
+        };
+        assert!(!qh.should_suppress(NotificationType::SlaEscalation, Channel::Sms, 1));
+    }
+
+    #[test]
+    fn notifier_error_display() {
+        let err = NotifierError::DeliveryFailed {
+            channel: "email".into(),
+            reason: "timeout".into(),
+        };
+        assert!(err.to_string().contains("email"));
+        assert!(err.to_string().contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_notification_sends_to_all_channels() {
+        let sender = InMemoryNotificationSender::default();
+        let params = DispatchParams {
+            notification_type: NotificationType::SensitiveReview,
+            recipient: "owner@example.com",
+            subject: "Urgent review",
+            body: "1-star review received",
+            entity_id: None,
+            quiet_hours: None,
+            current_hour: 12,
+        };
+        let results = dispatch_notification(&sender, &params).await;
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(sender.sent.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn dispatch_notification_respects_quiet_hours() {
+        let sender = InMemoryNotificationSender::default();
+        let qh = QuietHours {
+            start_hour: 22,
+            end_hour: 8,
+        };
+        let params = DispatchParams {
+            notification_type: NotificationType::DraftReady,
+            recipient: "owner@example.com",
+            subject: "Draft ready",
+            body: "New draft",
+            entity_id: None,
+            quiet_hours: Some(&qh),
+            current_hour: 23,
+        };
+        let results = dispatch_notification(&sender, &params).await;
+        assert!(results.is_empty());
+        assert!(sender.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_sensitive_sms_during_quiet_hours() {
+        let sender = InMemoryNotificationSender::default();
+        let qh = QuietHours {
+            start_hour: 22,
+            end_hour: 8,
+        };
+        let params = DispatchParams {
+            notification_type: NotificationType::SensitiveReview,
+            recipient: "owner@example.com",
+            subject: "Urgent",
+            body: "1-star",
+            entity_id: None,
+            quiet_hours: Some(&qh),
+            current_hour: 23,
+        };
+        let results = dispatch_notification(&sender, &params).await;
+        assert_eq!(results.len(), 1);
+        let sent = sender.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].channel, Channel::Sms);
     }
 }

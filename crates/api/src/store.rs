@@ -72,6 +72,65 @@ impl Store {
         state.drafts.insert(draft.id, draft);
     }
 
+    /// Ingest a review without a draft (e.g. from a webhook before the agent
+    /// has processed it). Deduplicates on `(platform, source_review_id)`.
+    pub async fn ingest_review(&self, review: Review) {
+        let mut state = self.0.lock().await;
+        let existing = state.reviews.values().find(|r| {
+            r.platform == review.platform && r.source_review_id == review.source_review_id
+        });
+        if existing.is_some() {
+            return;
+        }
+        state.reviews.insert(review.id, review);
+    }
+
+    /// Look up a review by its id (mutable access for status transitions).
+    pub async fn get_review_mut(
+        &self,
+        review_id: Uuid,
+    ) -> Result<Review, ApiError> {
+        let state = self.0.lock().await;
+        state
+            .reviews
+            .get(&review_id)
+            .cloned()
+            .ok_or(ApiError::NotFound)
+    }
+
+    /// Store a draft produced by the agent and update the review status.
+    pub async fn store_agent_draft(&self, draft: ReplyDraft) {
+        let mut state = self.0.lock().await;
+        let review_id = draft.review_id;
+        state.review_to_active_draft.insert(review_id, draft.id);
+        state.drafts.insert(draft.id, draft);
+        if let Some(review) = state.reviews.get_mut(&review_id) {
+            review.status = ReviewStatus::AwaitingHuman;
+        }
+    }
+
+    /// Transition a review to `Drafting` (for regeneration).
+    pub async fn transition_review_to_drafting(
+        &self,
+        review_id: Uuid,
+    ) -> Result<Review, ApiError> {
+        let mut state = self.0.lock().await;
+        let review = state
+            .reviews
+            .get_mut(&review_id)
+            .ok_or(ApiError::NotFound)?;
+
+        let fsm = ReviewFsm::new(review.status)
+            .apply(ReviewEvent::StartDrafting)
+            .map_err(|_| ApiError::InvalidTransition)?;
+        review.status = fsm.state();
+        let result = review.clone();
+
+        state.review_to_active_draft.remove(&review_id);
+
+        Ok(result)
+    }
+
     pub async fn list_drafts(&self) -> Vec<ReplyDraft> {
         let state = self.0.lock().await;
         state.drafts.values().cloned().collect()

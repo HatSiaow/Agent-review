@@ -91,6 +91,45 @@ pub fn validate_for_posting(draft: &ReplyDraft) -> Result<(), PostError> {
     Ok(())
 }
 
+/// Attempt to post a draft with exponential backoff retries.
+///
+/// Returns `Ok(())` on success or the final error after all retries are
+/// exhausted. The caller is responsible for updating the draft state
+/// (e.g. to `Posted` or `Failed`).
+pub async fn post_with_retries<P: PlatformPoster>(
+    poster: &P,
+    config: &PosterConfig,
+    platform: Platform,
+    source_review_id: &str,
+    reply_text: &str,
+) -> Result<(), PostError> {
+    let mut last_error = None;
+
+    for attempt in 0..=config.max_retries {
+        match poster
+            .post_reply(platform, source_review_id, reply_text)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(PostError::PlatformRejected(msg)) => {
+                return Err(PostError::PlatformRejected(msg));
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < config.max_retries {
+                    let backoff_ms = config.base_backoff_ms * 2u64.saturating_pow(attempt);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+    }
+
+    match last_error {
+        Some(e) => Err(e),
+        None => Err(PostError::RetriesExhausted(config.max_retries)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +198,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PostError::PlatformRejected(_)));
+    }
+
+    #[test]
+    fn edited_draft_not_valid_for_posting() {
+        assert!(validate_for_posting(&draft_in_state(DraftState::Edited)).is_err());
+    }
+
+    #[test]
+    fn failed_draft_not_valid() {
+        assert!(validate_for_posting(&draft_in_state(DraftState::Failed)).is_err());
+    }
+
+    #[test]
+    fn poster_config_defaults() {
+        let config = PosterConfig::default();
+        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.base_backoff_ms, 2000);
+    }
+
+    #[test]
+    fn post_error_display() {
+        let err = PostError::NotApproved(Uuid::new_v4());
+        assert!(err.to_string().contains("not in approved state"));
+
+        let err = PostError::RetriesExhausted(3);
+        assert!(err.to_string().contains('3'));
+
+        let err = PostError::PlatformRejected("content policy".into());
+        assert!(err.to_string().contains("content policy"));
+    }
+
+    #[tokio::test]
+    async fn post_with_retries_succeeds_immediately() {
+        let fake = InMemoryPoster::default();
+        let config = PosterConfig {
+            max_retries: 3,
+            base_backoff_ms: 1,
+        };
+        let result =
+            post_with_retries(&fake, &config, Platform::Google, "rev-1", "Thanks!").await;
+        assert!(result.is_ok());
+        assert_eq!(fake.posted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_with_retries_platform_rejected_no_retry() {
+        let fake = InMemoryPoster::default();
+        *fake.should_fail.lock().unwrap() = true;
+        let config = PosterConfig {
+            max_retries: 3,
+            base_backoff_ms: 1,
+        };
+        let result =
+            post_with_retries(&fake, &config, Platform::Google, "rev-1", "Thanks!").await;
+        assert!(matches!(result, Err(PostError::PlatformRejected(_))));
     }
 }
