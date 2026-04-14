@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
+use lettre::AsyncTransport as _;
 
 #[derive(Debug, Error)]
 pub enum NotifierError {
@@ -193,14 +194,14 @@ impl NotificationSender for SmtpSender {
         let from: lettre::message::Mailbox = self
             .cfg
             .from
-            .parse()
+            .parse::<lettre::message::Mailbox>()
             .map_err(|e| NotifierError::DeliveryFailed {
                 channel: notification.channel.to_string(),
                 reason: e.to_string(),
             })?;
         let to: lettre::message::Mailbox = notification
             .recipient
-            .parse()
+            .parse::<lettre::message::Mailbox>()
             .map_err(|e| NotifierError::DeliveryFailed {
                 channel: notification.channel.to_string(),
                 reason: e.to_string(),

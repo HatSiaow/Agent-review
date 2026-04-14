@@ -27,12 +27,6 @@ impl InMemoryRepository {
     }
 }
 
-impl InMemoryRepository {
-    fn api_err(err: RepositoryError) -> RepositoryError {
-        err
-    }
-}
-
 impl Repository for InMemoryRepository {
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
         let state = self.0.lock().await;

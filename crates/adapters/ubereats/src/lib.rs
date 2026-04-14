@@ -72,7 +72,7 @@ pub trait UberEatsReviewClient: Send + Sync {
     ) -> Result<(), UberEatsAdapterError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HttpUberEatsClient {
     http: reqwest::blocking::Client,
     token: std::sync::Mutex<Option<AccessToken>>,

@@ -45,9 +45,6 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
     let google_cfg = adapter_google::GoogleConfig::default();
     let ubereats_cfg = adapter_ubereats::UberEatsConfig::default();
 
-    let google_client = adapter_google::HttpGoogleClient::new();
-    let ubereats_client = adapter_ubereats::HttpUberEatsClient::new();
-
     let mut google_tick =
         tokio::time::interval(std::time::Duration::from_secs(google_cfg.poll_interval_secs));
     let mut ubereats_tick =
@@ -62,8 +59,7 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
             _ = google_tick.tick() => {
                 let cfg = google_cfg.clone();
                 let store2 = store.clone();
-                let client = google_client.clone();
-                let _ = tokio::task::spawn_blocking(move || client.list_reviews(&cfg))
+                let _ = tokio::task::spawn_blocking(move || adapter_google::HttpGoogleClient::new().list_reviews(&cfg))
                     .await
                     .ok()
                     .and_then(Result::ok)
@@ -79,8 +75,7 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
             _ = ubereats_tick.tick() => {
                 let cfg = ubereats_cfg.clone();
                 let store2 = store.clone();
-                let client = ubereats_client.clone();
-                let _ = tokio::task::spawn_blocking(move || client.list_reviews(&cfg))
+                let _ = tokio::task::spawn_blocking(move || adapter_ubereats::HttpUberEatsClient::new().list_reviews(&cfg))
                     .await
                     .ok()
                     .and_then(Result::ok)

@@ -69,7 +69,7 @@ pub trait GoogleReviewClient: Send + Sync {
     ) -> Result<(), GoogleAdapterError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HttpGoogleClient {
     http: reqwest::blocking::Client,
     token: std::sync::Mutex<Option<AccessToken>>,
