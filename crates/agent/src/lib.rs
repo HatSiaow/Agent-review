@@ -28,6 +28,129 @@ pub enum AgentError {
     BudgetExhausted(u8),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolCall {
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct ToolContext {
+    extra_context: String,
+    calls: Vec<ToolCall>,
+}
+
+impl ToolContext {
+    fn empty() -> Self {
+        Self {
+            extra_context: String::new(),
+            calls: Vec::new(),
+        }
+    }
+
+    fn tool_calls_count(&self) -> u8 {
+        u8::try_from(self.calls.len()).unwrap_or(u8::MAX)
+    }
+}
+
+fn lookup_policy(review: &Review) -> ToolContext {
+    let mut ctx = ToolContext::empty();
+    ctx.calls.push(ToolCall {
+        name: "lookup_policy".into(),
+    });
+
+    // Minimal policy hints consistent with SPECS: no refunds/liability, human escalation for sensitive.
+    let mut notes = Vec::new();
+    notes.push("Do not offer refunds or admit liability.".to_string());
+    notes.push("Do not request personal info (phone/email) publicly.".to_string());
+    if review.is_sensitive_rating() || contains_sensitive_keywords(review) {
+        notes.push("Sensitive: be empathetic, invite offline follow-up, avoid specifics.".to_string());
+    }
+    ctx.extra_context = format!("Policy:\n- {}", notes.join("\n- "));
+    ctx
+}
+
+fn lookup_menu_item(review: &Review) -> Option<ToolContext> {
+    let body = review.body_text.as_ref()?;
+    let lower = body.to_lowercase();
+    let needles = ["pasta", "naan", "biryani", "pizza", "salad"];
+    let mentioned: Vec<&str> = needles.iter().copied().filter(|n| lower.contains(n)).collect();
+    if mentioned.is_empty() {
+        return None;
+    }
+    let mut ctx = ToolContext::empty();
+    ctx.calls.push(ToolCall {
+        name: "lookup_menu_item".into(),
+    });
+    ctx.extra_context = format!(
+        "Menu items mentioned: {} (acknowledge specifically if appropriate).",
+        mentioned.join(", ")
+    );
+    Some(ctx)
+}
+
+fn get_past_replies(_review: &Review) -> ToolContext {
+    let mut ctx = ToolContext::empty();
+    ctx.calls.push(ToolCall {
+        name: "get_past_replies".into(),
+    });
+    ctx.extra_context = "Past replies: (none available in this demo build)".into();
+    ctx
+}
+
+fn translate_hint(review: &Review) -> Option<ToolContext> {
+    let lang = review.body_language.as_deref()?;
+    if lang.eq_ignore_ascii_case("en") {
+        return None;
+    }
+    let mut ctx = ToolContext::empty();
+    ctx.calls.push(ToolCall { name: "translate".into() });
+    ctx.extra_context = format!(
+        "Language: respond in {lang}. If unsure, keep it simple and polite."
+    );
+    Some(ctx)
+}
+
+fn check_banned_phrases(text: &str) -> Option<ToolContext> {
+    // Minimal, deterministic banned phrase scan. This intentionally mirrors guardrail intent.
+    let banned = ["refund", "lawsuit", "compensation", "DM me your phone", "email me"];
+    let lower = text.to_lowercase();
+    let found: Vec<&str> = banned.iter().copied().filter(|p| lower.contains(&p.to_lowercase())).collect();
+    if found.is_empty() {
+        return None;
+    }
+    let mut ctx = ToolContext::empty();
+    ctx.calls.push(ToolCall {
+        name: "check_banned_phrases".into(),
+    });
+    ctx.extra_context = format!("Banned phrases detected: {}", found.join(", "));
+    Some(ctx)
+}
+
+fn build_tool_context(review: &Review) -> ToolContext {
+    // Bounded tool calls (max 3) as per SPECS.
+    let mut merged = ToolContext::empty();
+
+    let candidates: Vec<Option<ToolContext>> = vec![
+        Some(lookup_policy(review)),
+        lookup_menu_item(review),
+        translate_hint(review),
+        Some(get_past_replies(review)),
+    ];
+
+    for c in candidates.into_iter().flatten() {
+        if merged.calls.len() >= 3 {
+            break;
+        }
+        if !merged.extra_context.is_empty() {
+            merged.extra_context.push_str("\n\n");
+        }
+        merged.extra_context.push_str(&c.extra_context);
+        merged.calls.extend(c.calls);
+    }
+
+    merged
+}
+
 /// Result of a single agent run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunResult {
@@ -107,6 +230,7 @@ pub async fn run_agent<C: LlmClient>(
     let model_tier = select_model_tier(review);
     let char_limit = review.reply_char_limit();
     let checks = domain::guardrails::default_checks();
+    let tool_ctx = build_tool_context(review);
 
     let guardrail_ctx = GuardrailContext {
         platform: review.platform,
@@ -129,7 +253,11 @@ pub async fn run_agent<C: LlmClient>(
             review_language: review.body_language.clone(),
             platform: review.platform,
             restaurant_name: config.restaurant_name.clone(),
-            restaurant_context: config.restaurant_context.clone(),
+            restaurant_context: if tool_ctx.extra_context.is_empty() {
+                config.restaurant_context.clone()
+            } else {
+                format!("{}\n\n{}", config.restaurant_context, tool_ctx.extra_context)
+            },
             model_tier,
             max_chars: char_limit,
             hint: current_hint.clone(),
@@ -148,15 +276,17 @@ pub async fn run_agent<C: LlmClient>(
             &checks,
         );
 
-        let has_warnings = !guardrail_result.warnings.is_empty();
+        let banned_phrase_ctx = check_banned_phrases(&response.reply_text);
+        let extra_warnings: Vec<String> = banned_phrase_ctx
+            .as_ref()
+            .map(|c| vec![c.extra_context.clone()])
+            .unwrap_or_default();
 
-        if !has_warnings || attempts >= MAX_GUARDRAIL_RETRIES {
+        let has_warnings = !guardrail_result.warnings.is_empty();
+        let has_any_warnings = has_warnings || !extra_warnings.is_empty();
+
+        if !has_any_warnings || attempts >= MAX_GUARDRAIL_RETRIES {
             let flags = classify_flags(review);
-            let warnings: Vec<String> = guardrail_result
-                .warnings
-                .iter()
-                .map(|w| w.rule.clone())
-                .collect();
 
             let mut draft = ReplyDraft::new_pending(
                 review.id,
@@ -165,9 +295,15 @@ pub async fn run_agent<C: LlmClient>(
             );
             draft.model_name = Some(response.model_name);
             draft.generated_by = Generator::AgentLlm;
-            draft.guardrail_warnings = warnings;
+            let mut all_warnings: Vec<String> = guardrail_result
+                .warnings
+                .iter()
+                .map(|w| w.rule.clone())
+                .collect();
+            all_warnings.extend(extra_warnings);
+            draft.guardrail_warnings = all_warnings;
             draft.flags = flags;
-            if has_warnings {
+            if has_any_warnings {
                 draft.flags.push("guardrail_warning".into());
             }
 
@@ -177,7 +313,7 @@ pub async fn run_agent<C: LlmClient>(
                 prompt_tokens: total_prompt_tokens,
                 completion_tokens: total_completion_tokens,
                 latency_ms: total_latency_ms,
-                tool_calls: 0,
+                tool_calls: tool_ctx.tool_calls_count(),
                 guardrail_result,
             });
         }
@@ -187,9 +323,13 @@ pub async fn run_agent<C: LlmClient>(
             .iter()
             .map(|w| format!("{}: {}", w.rule, w.message))
             .collect();
+        let mut combined = violation_rules;
+        if let Some(c) = banned_phrase_ctx {
+            combined.push(c.extra_context);
+        }
         let corrective_note = format!(
             "Your previous reply violated these guardrails: {}. Please fix these issues.",
-            violation_rules.join("; ")
+            combined.join("; ")
         );
         current_hint = Some(match current_hint {
             Some(h) => format!("{h}. {corrective_note}"),
