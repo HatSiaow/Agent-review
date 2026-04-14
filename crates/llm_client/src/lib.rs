@@ -72,6 +72,7 @@ impl Default for InMemoryLlm {
     }
 }
 
+#[async_trait::async_trait]
 impl LlmClient for InMemoryLlm {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, LlmError> {
         let reply = if let Some(hint) = &request.hint {
@@ -162,6 +163,7 @@ struct AnthropicContent {
     text: Option<String>,
 }
 
+#[async_trait::async_trait]
 impl LlmClient for AnthropicClient {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, LlmError> {
         let start = std::time::Instant::now();
