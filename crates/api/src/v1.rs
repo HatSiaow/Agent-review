@@ -551,6 +551,58 @@ mod tests {
     }
 
     #[test]
+    fn bulk_approve_empty_ids_returns_ok() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let body = serde_json::to_string(&json!({"ids": []})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/drafts/bulk-approve")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn bulk_approve_nonexistent_draft_returns_404() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let fake_id = Uuid::new_v4();
+        let body = serde_json::to_string(&json!({"ids": [fake_id]})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/drafts/bulk-approve")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn reject_missing_reason_returns_422() {
+        let (store, _, draft_id) = seeded_store();
+        let app = build_router(store);
+        let body = serde_json::to_string(&json!({})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/drafts/{draft_id}/reject"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
     fn regenerate_review_from_new_status() {
         let (store, review_id, _) = seeded_store();
         let app = build_router(store);
