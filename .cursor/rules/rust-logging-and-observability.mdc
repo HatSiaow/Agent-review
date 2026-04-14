@@ -1,0 +1,19 @@
+---
+description: Rust logging, metrics, and observability best practices
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: logging & observability
+
+- Prefer structured logs over stringly logs:
+  - Log fields as key/value, not concatenated text.
+- Log at the right layer:
+  - Libraries should avoid noisy logging by default; return structured errors and let binaries decide what to log.
+  - Binaries should log at boundaries (request/job start/end, retries, external calls).
+- Avoid logging secrets and PII:
+  - Treat tokens, passwords, and personal identifiers as sensitive by default.
+- Make logs actionable:
+  - Include identifiers needed to correlate events (request id, job id, resource id).
+  - Include error chains (root cause) when available.
+

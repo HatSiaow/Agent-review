@@ -1,0 +1,21 @@
+---
+description: Rust documentation and public API design practices
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: documentation & public API
+
+- Document public items (`pub`) with `///`:
+  - State **what** it does, **invariants/constraints**, and **error conditions**.
+  - Include a short example when it clarifies usage.
+- Keep the public API small and stable:
+  - Prefer re-exporting a curated API surface instead of exposing internal modules.
+  - Hide implementation details behind private modules and `pub(crate)` where possible.
+- Use Rustdoc to encode contracts:
+  - Clarify panic conditions (ideally: no panics in library code).
+  - Specify thread-safety expectations and async cancellation behavior.
+- Prefer semantic types:
+  - Use newtypes for IDs/units to prevent mixing domains.
+  - Use `NonZero*` types when “never zero” is a meaningful invariant.
+

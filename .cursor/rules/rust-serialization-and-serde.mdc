@@ -1,0 +1,18 @@
+---
+description: Rust serialization (serde) and data model best practices
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: serialization & data models
+
+- Separate domain models from wire/storage formats:
+  - Prefer dedicated DTO structs for JSON/protobuf/db rows, then convert into validated domain types.
+- Be explicit about compatibility:
+  - When formats are versioned, design for forward/backward compatibility (optional fields, defaults).
+- Avoid deriving serialization on core domain types by default:
+  - Keep invariants enforced by constructors; don’t allow invalid states to be deserialized silently.
+- Serde ergonomics:
+  - Use `#[serde(default)]` thoughtfully (it can hide missing-field bugs).
+  - Prefer `deny_unknown_fields` for strict APIs, and allow unknown fields for forward-compat where needed.
+

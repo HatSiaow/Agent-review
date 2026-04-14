@@ -1,0 +1,21 @@
+---
+description: Rust dependencies, features, and compile-time hygiene
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust: dependencies & features
+
+- Keep dependencies minimal and intentional:
+  - Prefer a small number of well-maintained crates over many niche ones.
+  - Avoid adding a crate when a few lines of code suffice and won’t become a maintenance burden.
+- Use Cargo features as product boundaries:
+  - Prefer opt-in features for heavyweight dependencies (TLS backends, async runtimes, crypto, etc.).
+  - Keep default features conservative for libraries.
+- Avoid “feature soup”:
+  - Document feature combinations that are supported.
+  - Don’t create features that subtly change core semantics unless necessary.
+- Compile-time hygiene:
+  - Avoid unnecessary macros/derive that balloon compile times unless they provide clear value.
+  - Prefer `cfg` gating that keeps unused code truly out of builds.
+
