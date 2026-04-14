@@ -11,6 +11,7 @@ workspace = true
 adapter-ubereats = { path = "../adapters/ubereats" }
 axum.workspace = true
 domain = { path = "../domain" }
+storage = { path = "../storage" }
 hex.workspace = true
 hmac.workspace = true
 http.workspace = true
