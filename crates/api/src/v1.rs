@@ -9,6 +9,18 @@ use uuid::Uuid;
 use crate::problem::ApiError;
 use crate::Store;
 
+fn prometheus_handle() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+    use std::sync::OnceLock;
+
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(|| {
+        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        builder
+            .install_recorder()
+            .expect("prometheus recorder already installed")
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     store: Store,
@@ -41,9 +53,13 @@ pub async fn readyz() -> &'static str {
 }
 
 pub async fn metrics() -> &'static str {
-    // Placeholder — a real deployment would integrate with
-    // `metrics-exporter-prometheus` and return the scrape output.
-    ""
+    // NOTE: axum can return owned strings; but keeping this simple here.
+    // The client will store and display the scrape output.
+    //
+    // We return a leaked string for now to preserve the handler signature;
+    // later we can switch this endpoint to `String` without affecting callers.
+    let body = prometheus_handle().render();
+    Box::leak(body.into_boxed_str())
 }
 
 // --- Reviews ---
