@@ -471,6 +471,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_calls_are_bounded_and_reported() {
+        let llm = InMemoryLlm::default();
+        let config = AgentConfig::default();
+        let r = review(5, Some("Amazing pasta!"));
+        let result = run_agent(&llm, &config, &r, None).await.unwrap();
+        assert!(result.tool_calls <= 3);
+        assert!(result.tool_calls > 0);
+    }
+
+    #[tokio::test]
+    async fn banned_phrase_adds_guardrail_warning_flag() {
+        let llm = InMemoryLlm {
+            default_reply: "We can offer a full refund. Please email me.".into(),
+        };
+        let config = AgentConfig::default();
+        let r = review(5, Some("ok"));
+        let result = run_agent(&llm, &config, &r, None).await.unwrap();
+        assert!(result.draft.flags.contains(&"guardrail_warning".into()));
+        assert!(!result.draft.guardrail_warnings.is_empty());
+    }
+
+    #[tokio::test]
     async fn run_agent_three_star_gets_needs_attention() {
         let llm = InMemoryLlm::default();
         let config = AgentConfig::default();
