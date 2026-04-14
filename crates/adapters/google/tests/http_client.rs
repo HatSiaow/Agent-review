@@ -49,10 +49,7 @@ async fn list_reviews_paginates_until_no_next_page_token() {
 
     let cfg = cfg_for(&api.uri(), &format!("{}/token", token.uri()));
     let client = HttpGoogleClient::new();
-    let res = tokio::task::spawn_blocking(move || client.list_reviews(&cfg))
-        .await
-        .unwrap()
-        .unwrap();
+    let res = client.list_reviews(&cfg).unwrap();
 
     assert!(res.len() >= 2);
 }
