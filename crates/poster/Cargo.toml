@@ -8,6 +8,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+adapter-google = { path = "../adapters/google" }
+adapter-ubereats = { path = "../adapters/ubereats" }
 domain = { path = "../domain" }
 thiserror.workspace = true
 tokio.workspace = true

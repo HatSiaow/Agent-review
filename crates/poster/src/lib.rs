@@ -3,6 +3,8 @@
 
 use std::future::Future;
 
+use adapter_google::{GoogleConfig, GoogleReviewClient, HttpGoogleClient};
+use adapter_ubereats::{HttpUberEatsClient, UberEatsConfig, UberEatsReviewClient};
 use domain::{DraftEvent, DraftFsm, Platform, ReplyDraft};
 use thiserror::Error;
 use uuid::Uuid;
@@ -48,6 +50,22 @@ pub trait PlatformPoster: Send + Sync {
     ) -> impl Future<Output = Result<(), PostError>> + Send;
 }
 
+#[derive(Debug, Clone)]
+pub struct HttpPlatformPoster {
+    google: Option<(HttpGoogleClient, GoogleConfig)>,
+    ubereats: Option<(HttpUberEatsClient, UberEatsConfig)>,
+}
+
+impl HttpPlatformPoster {
+    #[must_use]
+    pub fn new(
+        google: Option<(HttpGoogleClient, GoogleConfig)>,
+        ubereats: Option<(HttpUberEatsClient, UberEatsConfig)>,
+    ) -> Self {
+        Self { google, ubereats }
+    }
+}
+
 /// In-memory poster for testing.
 #[derive(Debug, Default)]
 pub struct InMemoryPoster {
@@ -79,6 +97,79 @@ impl PlatformPoster for InMemoryPoster {
             reply_text: reply_text.into(),
         });
         Ok(())
+    }
+}
+
+impl PlatformPoster for HttpPlatformPoster {
+    async fn post_reply(
+        &self,
+        platform: Platform,
+        source_review_id: &str,
+        reply_text: &str,
+    ) -> Result<(), PostError> {
+        match platform {
+            Platform::Google => {
+                let Some((client, cfg)) = self.google.clone() else {
+                    return Err(PostError::NetworkError {
+                        platform,
+                        message: "google poster not configured".into(),
+                    });
+                };
+                let review_id = source_review_id.to_string();
+                let reply = reply_text.to_string();
+                tokio::task::spawn_blocking(move || client.post_reply(&cfg, &review_id, &reply))
+                    .await
+                    .map_err(|e| PostError::NetworkError {
+                        platform,
+                        message: e.to_string(),
+                    })?
+                    .map_err(|e| match e {
+                        adapter_google::GoogleAdapterError::ApiError { status: _, body } => {
+                            PostError::PlatformRejected(body)
+                        }
+                        adapter_google::GoogleAdapterError::AuthError => PostError::NetworkError {
+                            platform,
+                            message: "auth error".into(),
+                        },
+                        other => PostError::NetworkError {
+                            platform,
+                            message: other.to_string(),
+                        },
+                    })
+            }
+            Platform::Ubereats => {
+                let Some((client, cfg)) = self.ubereats.clone() else {
+                    return Err(PostError::NetworkError {
+                        platform,
+                        message: "ubereats poster not configured".into(),
+                    });
+                };
+                let review_id = source_review_id.to_string();
+                let reply = reply_text.to_string();
+                tokio::task::spawn_blocking(move || client.post_reply(&cfg, &review_id, &reply))
+                    .await
+                    .map_err(|e| PostError::NetworkError {
+                        platform,
+                        message: e.to_string(),
+                    })?
+                    .map_err(|e| match e {
+                        adapter_ubereats::UberEatsAdapterError::ApiError { status: _, body } => {
+                            PostError::PlatformRejected(body)
+                        }
+                        adapter_ubereats::UberEatsAdapterError::AuthError => PostError::NetworkError {
+                            platform,
+                            message: "auth error".into(),
+                        },
+                        adapter_ubereats::UberEatsAdapterError::DriftDetected => {
+                            PostError::PlatformRejected("drift_detected".into())
+                        }
+                        other => PostError::NetworkError {
+                            platform,
+                            message: other.to_string(),
+                        },
+                    })
+            }
+        }
     }
 }
 
