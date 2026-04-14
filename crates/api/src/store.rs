@@ -121,4 +121,26 @@ impl Store {
             .await
             .map_err(Self::map_err)
     }
+
+    pub async fn mark_draft_posted(
+        &self,
+        draft_id: Uuid,
+        posted_at: time::OffsetDateTime,
+    ) -> Result<ReplyDraft, ApiError> {
+        self.repo
+            .mark_draft_posted(draft_id, posted_at)
+            .await
+            .map_err(Self::map_err)
+    }
+
+    pub async fn mark_draft_post_failed(
+        &self,
+        draft_id: Uuid,
+        error: String,
+    ) -> Result<ReplyDraft, ApiError> {
+        self.repo
+            .mark_draft_post_failed(draft_id, error)
+            .await
+            .map_err(Self::map_err)
+    }
 }

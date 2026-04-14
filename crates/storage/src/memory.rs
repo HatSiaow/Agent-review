@@ -244,5 +244,41 @@ impl Repository for InMemoryRepository {
 
         Ok(results)
     }
+
+    async fn mark_draft_posted(
+        &self,
+        draft_id: Uuid,
+        posted_at: OffsetDateTime,
+    ) -> RepositoryResult<ReplyDraft> {
+        let mut state = self.0.lock().await;
+        let draft = state
+            .drafts
+            .get_mut(&draft_id)
+            .ok_or(RepositoryError::NotFound)?;
+        let fsm = DraftFsm::new(draft.state)
+            .apply(DraftEvent::MarkPosted)
+            .map_err(|_| RepositoryError::InvalidTransition)?;
+        draft.state = fsm.state();
+        draft.posted_at = Some(posted_at);
+        Ok(draft.clone())
+    }
+
+    async fn mark_draft_post_failed(
+        &self,
+        draft_id: Uuid,
+        error: String,
+    ) -> RepositoryResult<ReplyDraft> {
+        let mut state = self.0.lock().await;
+        let draft = state
+            .drafts
+            .get_mut(&draft_id)
+            .ok_or(RepositoryError::NotFound)?;
+        let fsm = DraftFsm::new(draft.state)
+            .apply(DraftEvent::Fail)
+            .map_err(|_| RepositoryError::InvalidTransition)?;
+        draft.state = fsm.state();
+        draft.platform_post_error = Some(error);
+        Ok(draft.clone())
+    }
 }
 

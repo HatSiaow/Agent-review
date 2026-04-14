@@ -555,5 +555,64 @@ impl Repository for PgRepository {
         }
         Ok(out)
     }
+
+    async fn mark_draft_posted(
+        &self,
+        draft_id: Uuid,
+        posted_at: OffsetDateTime,
+    ) -> RepositoryResult<ReplyDraft> {
+        let res = sqlx::query(
+            r#"
+            update reply_drafts
+            set state = 'posted',
+                posted_at = $1,
+                platform_post_error = null
+            where id = $2 and state = 'approved'
+            "#,
+        )
+        .bind(posted_at)
+        .bind(draft_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::InvalidTransition);
+        }
+        let row: DraftRow = sqlx::query_as("select * from reply_drafts where id = $1")
+            .bind(draft_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        draft_from_row(row)
+    }
+
+    async fn mark_draft_post_failed(
+        &self,
+        draft_id: Uuid,
+        error: String,
+    ) -> RepositoryResult<ReplyDraft> {
+        let res = sqlx::query(
+            r#"
+            update reply_drafts
+            set state = 'failed',
+                platform_post_error = $1
+            where id = $2 and state = 'approved'
+            "#,
+        )
+        .bind(error)
+        .bind(draft_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::InvalidTransition);
+        }
+        let row: DraftRow = sqlx::query_as("select * from reply_drafts where id = $1")
+            .bind(draft_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        draft_from_row(row)
+    }
 }
 

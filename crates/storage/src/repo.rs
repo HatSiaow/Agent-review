@@ -52,5 +52,17 @@ pub trait Repository: Send + Sync + 'static {
         draft_ids: &[Uuid],
         reviewed_by: Uuid,
     ) -> RepositoryResult<Vec<ReplyDraft>>;
+
+    async fn mark_draft_posted(
+        &self,
+        draft_id: Uuid,
+        posted_at: time::OffsetDateTime,
+    ) -> RepositoryResult<ReplyDraft>;
+
+    async fn mark_draft_post_failed(
+        &self,
+        draft_id: Uuid,
+        error: String,
+    ) -> RepositoryResult<ReplyDraft>;
 }
 
