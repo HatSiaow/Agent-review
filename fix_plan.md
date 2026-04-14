@@ -14,14 +14,12 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/domain/src/{fsm.rs,review_fsm.rs,audit.rs}`, `crates/api/src/v1.rs`, `crates/poster/src/lib.rs`, `crates/server/src/main.rs`.
   - **Fix Problem Details to be RFC 9457-aligned** (content-type `application/problem+json`, proper `instance`, consistent mapping of validation errors) per `specs/coder/11-api-design.md`.
     - Code: `crates/api/src/problem.rs`, `crates/api/src/v1.rs`.
-
 - **P0 — Data/storage correctness (otherwise the inbox will lose/duplicate work)**
   - **Make storage schema + repo behavior match the specs** (`model_version`, defaults, indexes, constraints, proper tables) per `specs/coder/08-data-storage.md` and `specs/coder/04-unified-review-data-model.md`.
     - Biggest mismatches: `agent_runs`, `notifications_outbox`, `reviews_sync_state`, `users` columns/constraints, missing defaults/indexes.
     - Code: `crates/storage/migrations/0001_init.sql`, `crates/storage/src/pg.rs`.
   - **Retention / `storage_gc` job** (raw_payload redaction after 90d; agent_runs 180d; etc.) per `specs/coder/08-data-storage.md` and `specs/coder/15-security-privacy-compliance.md`.
     - Code: new worker/binary path (likely `crates/server` role + `crates/storage` SQL helpers).
-
 - **P0 — Web UI (the “single inbox” is not usable without it)**
   - **Implement server-rendered UI (Askama + htmx) routes and templates** per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md`.
     - Missing entirely: no `web_ui` crate, no templates, no HTML routes (`GET /`, `GET /reviews/{id}`, `GET /settings`, `GET /users`, auth pages).
@@ -29,7 +27,6 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Queue semantics in UI** (Needs You Now / Ready To Send / History tabs, filters, sorting, card constraints) per `specs/coder/06-human-in-the-loop-workflow.md` and `specs/coder/16-frontend-web-ui.md`.
     - Current: JSON list endpoints exist but do not implement filters/sorting/tab semantics.
     - Code: `crates/api/src/v1.rs`, storage query methods.
-
 - **P1 — Reliable workflow orchestration (ingestion → agent → approve → poster)**
   - **Replace demo “scan loops” with durable job/outbox processing** per `specs/coder/01-architecture.md`, `specs/coder/07-notification-system.md`, `specs/coder/13-deployment-infra.md` and the new `specs/coder/17-work-queues-and-outbox-processing.md`.
     - Current `crates/server/src/main.rs` polls `list_reviews/list_drafts` every 2s and uses in-memory de-dupe; no durable queues/outbox claims.
@@ -40,21 +37,20 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Poster worker correctness** (idempotent posting, drift detection, retries persisted, surface platform rejections) per `specs/coder/01-architecture.md` and platform specs (`02`, `03`).
     - Current: retries exist but no durable job records; drift detection is largely missing.
     - Code: `crates/poster/src/lib.rs`, `crates/server/src/main.rs`, adapters + storage.
-
 - **P1 — Notifications (owner should actually get notified, without noise)**
   - **Implement notifier outbox pipeline with idempotency store** per `specs/coder/07-notification-system.md`.
     - Current: server sends “DraftReady” once per draft id via in-memory sender; outbox schema doesn’t match spec and is unused.
     - Code: `crates/notifier/src/lib.rs`, `crates/storage/migrations/0001_init.sql`, `crates/server/src/main.rs`.
   - **Digest batching + quiet hours** per `specs/coder/07-notification-system.md`.
   - **SLA timers** (2h breach, 24h escalation, 72h auto-skip) per `specs/coder/06-human-in-the-loop-workflow.md`.
-
 - **P2 — Agent quality + traceability**
   - **Implement `agent_runs` persistence** with the spec fields (tokens, latency, tool calls JSON, guardrail verdict, error) per `specs/coder/05-ai-response-agent.md` and `specs/coder/08-data-storage.md`.
-    - Current: `agent_runs` table shape diverges from spec and is not written by code.
-    - Code: `crates/agent/src/lib.rs`, `crates/storage/migrations/0001_init.sql`, `crates/storage/src/pg.rs`.
+    - Current: implemented with a new migration + repo methods; schema alignment is partial (legacy columns remain). Completed for v0.1 observability.
+    - Migrations: `crates/storage/migrations/0004_agent_runs_observability.sql`
+    - Code: `crates/agent/src/lib.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`.
   - **Compute and store `prompt_fingerprint`** (and version prompts) per `specs/coder/05-ai-response-agent.md`.
-    - Current: column exists but not populated by the agent.
-    - Code: `crates/agent/src/lib.rs`, `crates/domain/src/model.rs`, `crates/storage/src/pg.rs`.
+    - Current: computed as `sha256(prompt)` in `llm_client` and stored on `reply_drafts`.
+    - Code: `crates/llm_client/src/lib.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`.
   - **Fix `llm_client` usage accounting and cost cap enforcement** per `specs/coder/05-ai-response-agent.md` and `specs/coder/13-deployment-infra.md`.
     - Current gaps: prompt/completion tokens are always `0`; “usage logs” and monthly cost-cap enforcement are not implemented.
     - Code: `crates/llm_client/src/lib.rs`.
@@ -66,21 +62,19 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Replace hard-coded “Chez Luca” defaults with persisted restaurant settings** (name, cuisine, hours, signature dishes, voice) per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md` (`/api/v1/settings`).
     - Current: agent config and prompts embed demo defaults; no settings endpoints/storage exist.
     - Code: `crates/agent/src/lib.rs`, `crates/llm_client/src/lib.rs`, `crates/api/src/v1.rs`, `crates/storage` (new table), UI templates.
-
 - **P2 — Spec-complete platform behaviors**
   - **Google adapter watermark + stop paging** + configurable host/path, jittered backoff up to 5 minutes, drift detection/withdrawn handling per `specs/coder/02-google-reviews-integration.md`.
     - Code: `crates/adapters/google/src/lib.rs`, `crates/adapters/google/src/normalize.rs`.
   - **UberEats polling “since”** watermark + DLQ behavior + drift detection (don’t double-reply) per `specs/coder/03-ubereats-reviews-integration.md`.
     - Code: `crates/adapters/ubereats/src/lib.rs`, `crates/adapters/ubereats/src/normalize.rs`, `crates/api/src/webhooks.rs`.
-
 - **P3 — Observability, operations, and test coverage**
   - **Telemetry bootstrap** (JSON logs in prod, OTLP tracing, redaction, standard span fields) per `specs/coder/12-observability.md`.
     - Current: minimal fmt subscriber only.
     - Code: `crates/common/src/lib.rs`, all binaries’ `main.rs`.
   - **Metrics emission for core flows** (ingestion/agent/posting/notifications/http/db) per `specs/coder/12-observability.md`.
   - **Readiness checks** (DB + secrets reachable) per `specs/coder/12-observability.md` and `specs/coder/11-api-design.md`.
-    - Current `readyz` is unconditional “ok”.
-    - Code: `crates/api/src/v1.rs`.
+    - Current: `/readyz` now does repository ping and returns `503` `application/problem+json` on failure; secrets reachability still pending until a secrets backend exists.
+    - Code: `crates/api/src/v1.rs`, `crates/api/src/problem.rs`, `crates/storage/src/repo.rs`.
   - **Implement config loading via `figment` + `APP_ENV` + `APP_` env prefix** per `specs/coder/13-deployment-infra.md` and `specs/coder/10-rust-tech-stack.md`.
     - Current: ad-hoc env reads, inconsistent naming (`APP_BIND_ADDR` vs `DATABASE_URL` vs `ANTHROPIC_API_KEY`), and no `config/` directory.
     - Code: `crates/common`, all binaries, `crates/storage/src/pg.rs`.
@@ -92,7 +86,6 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Finish CLI operational commands** (`google-auth` flow, token rotation, migrate status, replay tools) per `specs/coder/09-auth-and-secrets.md`, `specs/coder/08-data-storage.md`, `specs/coder/10-rust-tech-stack.md`.
     - Current: `google-auth` and `migrate status` are placeholders.
     - Code: `crates/cli/src/main.rs`.
-
 - **Completed (this session)**
   - **Storage upsert semantics for reviews (pg + memory)**: switched to “update on conflict” semantics (no more `DO NOTHING`); refreshes stored review data when a duplicate `(platform, source_review_id)` arrives.
     - Code: `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
@@ -112,4 +105,10 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Implement migrations runner (embedded migrations) and update CLI to await**: embedded migrations and ensured CLI blocks until migrations complete.
     - Migrations: `crates/storage/migrations/0002_webhook_events.sql`, `crates/storage/migrations/0003_idempotency_keys.sql`
     - Code: `crates/storage/src/pg.rs`, `crates/server/src/main.rs`
-
+  - **Compute and store `prompt_fingerprint` on reply drafts**: compute `sha256(prompt)` in `llm_client` and persist it on `reply_drafts` for traceability.
+    - Code: `crates/llm_client/src/lib.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **Implement `agent_runs` persistence for v0.1 observability**: add `agent_runs` migration and repo methods; spec alignment is partial (legacy columns remain).
+    - Migrations: `crates/storage/migrations/0004_agent_runs_observability.sql`
+    - Code: `crates/agent/src/lib.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **Readiness checks wired to repository ping**: `/readyz` now pings the repo and returns `503` `application/problem+json` on failure; secrets reachability still pending until secrets backend exists.
+    - Code: `crates/api/src/v1.rs`, `crates/api/src/problem.rs`, `crates/storage/src/repo.rs`
