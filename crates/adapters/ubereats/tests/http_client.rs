@@ -38,8 +38,7 @@ async fn list_reviews_returns_reviews_array() {
         .await;
 
     let cfg = cfg_for(&api.uri(), &format!("{}/token", token.uri()));
-    let client = HttpUberEatsClient::new();
-    let res = tokio::task::spawn_blocking(move || client.list_reviews(&cfg))
+    let res = tokio::task::spawn_blocking(move || HttpUberEatsClient::new().list_reviews(&cfg))
         .await
         .unwrap()
         .unwrap();

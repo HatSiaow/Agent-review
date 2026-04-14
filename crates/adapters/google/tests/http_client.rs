@@ -48,8 +48,7 @@ async fn list_reviews_paginates_until_no_next_page_token() {
         .await;
 
     let cfg = cfg_for(&api.uri(), &format!("{}/token", token.uri()));
-    let client = HttpGoogleClient::new();
-    let res = tokio::task::spawn_blocking(move || client.list_reviews(&cfg))
+    let res = tokio::task::spawn_blocking(move || HttpGoogleClient::new().list_reviews(&cfg))
         .await
         .unwrap()
         .unwrap();
