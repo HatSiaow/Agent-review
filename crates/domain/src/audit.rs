@@ -71,7 +71,7 @@ pub struct AuditEvent {
     #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
     pub actor_type: ActorType,
-    pub actor_id: Option<String>,
+    pub actor_id: Option<Uuid>,
     pub entity_type: String,
     pub entity_id: Uuid,
     pub event_type: EventType,
@@ -82,7 +82,7 @@ impl AuditEvent {
     #[must_use]
     pub fn new(
         actor_type: ActorType,
-        actor_id: Option<String>,
+        actor_id: Option<Uuid>,
         entity_type: impl Into<String>,
         entity_id: Uuid,
         event_type: EventType,
@@ -110,7 +110,7 @@ mod tests {
     fn audit_event_round_trips() {
         let event = AuditEvent::new(
             ActorType::User,
-            Some("user-123".into()),
+            Some(Uuid::new_v4()),
             "review",
             Uuid::new_v4(),
             EventType::DraftApproved,

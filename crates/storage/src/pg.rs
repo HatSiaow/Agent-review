@@ -46,14 +46,14 @@ impl PgRepository {
         &self.pool
     }
 
-    pub fn migrate(&self) -> Result<(), sqlx::Error> {
-        // NOTE: Intentionally minimal; we use raw SQL migrations in this crate.
-        // In a follow-up we can switch to an embedded migrator.
-        //
-        // For now, callers can run the initial migration file manually in dev,
-        // and tests can create schema per connection.
-        let _ = &self.pool;
-        Ok(())
+    /// Apply embedded SQL migrations for this crate.
+    ///
+    /// This is critical for correctness in production and CI: without applying migrations,
+    /// background workers and the API can silently fail (missing tables/indexes) and
+    /// the "single inbox" will lose or duplicate work.
+    pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
+        // Embeds `crates/storage/migrations/*.sql` into the binary at compile time.
+        sqlx::migrate!("./migrations").run(&self.pool).await
     }
 }
 
@@ -100,6 +100,18 @@ struct DraftRow {
     platform_post_error: Option<String>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AuditEventRow {
+    id: Uuid,
+    occurred_at: OffsetDateTime,
+    actor_type: String,
+    actor_id: Option<Uuid>,
+    entity_type: String,
+    entity_id: Uuid,
+    event_type: String,
+    details_json: serde_json::Value,
+}
+
 fn parse_platform(s: &str) -> Result<domain::Platform, RepositoryError> {
     match s {
         "google" => Ok(domain::Platform::Google),
@@ -139,6 +151,35 @@ fn parse_draft_state(s: &str) -> Result<DraftState, RepositoryError> {
         "posted" => Ok(DraftState::Posted),
         "failed" => Ok(DraftState::Failed),
         _ => Err(RepositoryError::Storage("invalid draft state".to_string())),
+    }
+}
+
+fn parse_actor_type(s: &str) -> Result<domain::ActorType, RepositoryError> {
+    match s {
+        "user" => Ok(domain::ActorType::User),
+        "system" => Ok(domain::ActorType::System),
+        "agent" => Ok(domain::ActorType::Agent),
+        _ => Err(RepositoryError::Storage("invalid actor_type".to_string())),
+    }
+}
+
+fn parse_event_type(s: &str) -> Result<domain::EventType, RepositoryError> {
+    match s {
+        "review_ingested" => Ok(domain::EventType::ReviewIngested),
+        "review_withdrawn" => Ok(domain::EventType::ReviewWithdrawn),
+        "review_skipped" => Ok(domain::EventType::ReviewSkipped),
+        "review_unskipped" => Ok(domain::EventType::ReviewUnskipped),
+        "draft_created" => Ok(domain::EventType::DraftCreated),
+        "draft_approved" => Ok(domain::EventType::DraftApproved),
+        "draft_edited" => Ok(domain::EventType::DraftEdited),
+        "draft_rejected" => Ok(domain::EventType::DraftRejected),
+        "draft_posted" => Ok(domain::EventType::DraftPosted),
+        "draft_post_failed" => Ok(domain::EventType::DraftPostFailed),
+        "drift_detected" => Ok(domain::EventType::DriftDetected),
+        "login_success" => Ok(domain::EventType::LoginSuccess),
+        "login_failed" => Ok(domain::EventType::LoginFailed),
+        "password_reset" => Ok(domain::EventType::PasswordReset),
+        _ => Err(RepositoryError::Storage("invalid event_type".to_string())),
     }
 }
 
@@ -197,6 +238,44 @@ fn draft_from_row(row: DraftRow) -> Result<ReplyDraft, RepositoryError> {
     })
 }
 
+fn audit_from_row(row: AuditEventRow) -> Result<domain::AuditEvent, RepositoryError> {
+    Ok(domain::AuditEvent {
+        id: row.id,
+        occurred_at: row.occurred_at,
+        actor_type: parse_actor_type(&row.actor_type)?,
+        actor_id: row.actor_id,
+        entity_type: row.entity_type,
+        entity_id: row.entity_id,
+        event_type: parse_event_type(&row.event_type)?,
+        details_json: row.details_json,
+    })
+}
+
+impl PgRepository {
+    async fn append_audit(&self, event: domain::AuditEvent) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r"
+            insert into audit_events (
+              id, occurred_at, actor_type, actor_id,
+              entity_type, entity_id, event_type, details_json
+            ) values ($1,$2,$3,$4,$5,$6,$7,$8)
+            ",
+        )
+        .bind(event.id)
+        .bind(event.occurred_at)
+        .bind(event.actor_type.to_string())
+        .bind(event.actor_id)
+        .bind(event.entity_type)
+        .bind(event.entity_id)
+        .bind(event.event_type.to_string())
+        .bind(event.details_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl Repository for PgRepository {
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
@@ -247,7 +326,7 @@ impl Repository for PgRepository {
         let status = _review.status.to_string();
         let avatar_url = _review.author.avatar_url.as_ref().map(ToString::to_string);
 
-        let res = sqlx::query(
+        let stored_id: Option<Uuid> = sqlx::query_scalar(
             r"
             insert into reviews (
               id, platform, source_review_id, source_location_id,
@@ -264,7 +343,27 @@ impl Repository for PgRepository {
               $13,$14,
               $15,$16,$17
             )
-            on conflict (platform, source_review_id) do nothing
+            on conflict (platform, source_review_id) do update set
+              source_location_id = excluded.source_location_id,
+              author_display_name = excluded.author_display_name,
+              author_avatar_url = excluded.author_avatar_url,
+              rating = excluded.rating,
+              body_text = excluded.body_text,
+              body_language = excluded.body_language,
+              created_at = least(reviews.created_at, excluded.created_at),
+              updated_at = greatest(reviews.updated_at, excluded.updated_at),
+              ingested_at = excluded.ingested_at,
+              existing_reply_text = excluded.existing_reply_text,
+              existing_reply_updated_at = excluded.existing_reply_updated_at,
+              context_json = excluded.context_json,
+              raw_payload = excluded.raw_payload
+            where
+              excluded.updated_at > reviews.updated_at
+              or excluded.rating <> reviews.rating
+              or excluded.body_text is distinct from reviews.body_text
+              or excluded.existing_reply_text is distinct from reviews.existing_reply_text
+              or excluded.existing_reply_updated_at is distinct from reviews.existing_reply_updated_at
+            returning reviews.id
             ",
         )
         .bind(_review.id)
@@ -284,12 +383,20 @@ impl Repository for PgRepository {
         .bind(status)
         .bind(_review.context_json)
         .bind(_review.raw_payload)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Storage(e.to_string()))?;
 
-        if res.rows_affected() == 0 {
-            return Ok(());
+        if let Some(stored_id) = stored_id {
+            self.append_audit(domain::AuditEvent::new(
+                domain::ActorType::System,
+                None,
+                "review",
+                stored_id,
+                domain::EventType::ReviewIngested,
+                serde_json::json!({}),
+            ))
+            .await?;
         }
         Ok(())
     }
@@ -301,6 +408,134 @@ impl Repository for PgRepository {
     ) -> RepositoryResult<()> {
         self.ingest_review(_review).await?;
         self.store_agent_draft(_draft).await?;
+        Ok(())
+    }
+
+    async fn get_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+    ) -> RepositoryResult<Option<OffsetDateTime>> {
+        let platform = platform.to_string();
+        let t: Option<OffsetDateTime> = sqlx::query_scalar(
+            r"
+            select last_seen_update_time
+            from reviews_sync_state
+            where platform = $1
+            ",
+        )
+        .bind(platform)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(t)
+    }
+
+    async fn set_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+        last_seen_update_time: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let platform = platform.to_string();
+        sqlx::query(
+            r"
+            insert into reviews_sync_state (platform, last_seen_update_time)
+            values ($1, $2)
+            on conflict (platform) do update
+            set last_seen_update_time = excluded.last_seen_update_time
+            ",
+        )
+        .bind(platform)
+        .bind(last_seen_update_time)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn register_webhook_event(
+        &self,
+        platform: domain::Platform,
+        event_id: &str,
+        received_at: OffsetDateTime,
+    ) -> RepositoryResult<bool> {
+        let platform = platform.to_string();
+        let res = sqlx::query(
+            r"
+            insert into webhook_events (platform, event_id, received_at)
+            values ($1, $2, $3)
+            on conflict (platform, event_id) do nothing
+            ",
+        )
+        .bind(platform)
+        .bind(event_id)
+        .bind(received_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn list_audit_events(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> RepositoryResult<Vec<domain::AuditEvent>> {
+        let rows: Vec<AuditEventRow> = sqlx::query_as(
+            r"
+            select *
+            from audit_events
+            where entity_type = $1 and entity_id = $2
+            order by occurred_at desc
+            ",
+        )
+        .bind(entity_type)
+        .bind(entity_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        rows.into_iter().map(audit_from_row).collect()
+    }
+
+    async fn get_idempotency_response(
+        &self,
+        idempotency_key: &str,
+    ) -> RepositoryResult<Option<(u16, serde_json::Value)>> {
+        let row: Option<(i16, serde_json::Value)> = sqlx::query_as(
+            r"
+            select status, body_json
+            from idempotency_responses
+            where idempotency_key = $1
+            ",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(row.map(|(status, body)| (u16::try_from(status).unwrap_or(500), body)))
+    }
+
+    async fn put_idempotency_response(
+        &self,
+        idempotency_key: &str,
+        status: u16,
+        body_json: serde_json::Value,
+        created_at: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let status_i16 = i16::try_from(status).unwrap_or(500);
+        sqlx::query(
+            r"
+            insert into idempotency_responses (idempotency_key, status, body_json, created_at)
+            values ($1, $2, $3, $4)
+            on conflict (idempotency_key) do nothing
+            ",
+        )
+        .bind(idempotency_key)
+        .bind(status_i16)
+        .bind(body_json)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -331,6 +566,15 @@ impl Repository for PgRepository {
             return Err(RepositoryError::InvalidTransition);
         }
         let (review, _) = self.get_review(_review_id).await?;
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::System,
+            None,
+            "review",
+            _review_id,
+            domain::EventType::ReviewSkipped,
+            serde_json::json!({}),
+        ))
+        .await?;
         Ok(review)
     }
 
@@ -344,6 +588,15 @@ impl Repository for PgRepository {
             return Err(RepositoryError::InvalidTransition);
         }
         let (review, _) = self.get_review(_review_id).await?;
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::System,
+            None,
+            "review",
+            _review_id,
+            domain::EventType::ReviewUnskipped,
+            serde_json::json!({}),
+        ))
+        .await?;
         Ok(review)
     }
 
@@ -406,6 +659,16 @@ impl Repository for PgRepository {
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
 
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::Agent,
+            None,
+            "draft",
+            _draft.id,
+            domain::EventType::DraftCreated,
+            serde_json::json!({ "review_id": _draft.review_id }),
+        ))
+        .await?;
+
         Ok(())
     }
 
@@ -415,6 +678,7 @@ impl Repository for PgRepository {
         _reviewed_by: Uuid,
         _new_text: Option<String>,
     ) -> RepositoryResult<ReplyDraft> {
+        let was_edited = _new_text.is_some();
         if let Some(text) = _new_text {
             let char_count = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
             let res = sqlx::query(
@@ -465,7 +729,21 @@ impl Repository for PgRepository {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
-        draft_from_row(row)
+        let draft = draft_from_row(row)?;
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::User,
+            Some(_reviewed_by),
+            "draft",
+            _draft_id,
+            if was_edited {
+                domain::EventType::DraftEdited
+            } else {
+                domain::EventType::DraftApproved
+            },
+            serde_json::json!({ "review_id": draft.review_id }),
+        ))
+        .await?;
+        Ok(draft)
     }
 
     async fn reject_draft(
@@ -500,7 +778,17 @@ impl Repository for PgRepository {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
-        draft_from_row(row)
+        let draft = draft_from_row(row)?;
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::User,
+            Some(_reviewed_by),
+            "draft",
+            _draft_id,
+            domain::EventType::DraftRejected,
+            serde_json::json!({ "review_id": draft.review_id }),
+        ))
+        .await?;
+        Ok(draft)
     }
 
     async fn bulk_approve(
@@ -565,7 +853,17 @@ impl Repository for PgRepository {
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| RepositoryError::Storage(e.to_string()))?;
-            out.push(draft_from_row(row)?);
+            let draft = draft_from_row(row)?;
+            self.append_audit(domain::AuditEvent::new(
+                domain::ActorType::User,
+                Some(_reviewed_by),
+                "draft",
+                id,
+                domain::EventType::DraftApproved,
+                serde_json::json!({ "bulk": true, "review_id": draft.review_id }),
+            ))
+            .await?;
+            out.push(draft);
         }
 
         Ok(out)
@@ -637,7 +935,12 @@ impl Repository for PgRepository {
                 posted_at = $1,
                 platform_post_error = null,
                 post_eligible_at = null
-            where id = $2 and state in ('approved','approved_pending_undo')
+            where id = $2
+              and state in ('approved','approved_pending_undo')
+              and (
+                state <> 'approved_pending_undo'
+                or (post_eligible_at is not null and $1 >= post_eligible_at)
+              )
             ",
         )
         .bind(posted_at)
@@ -653,7 +956,17 @@ impl Repository for PgRepository {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
-        draft_from_row(row)
+        let draft = draft_from_row(row)?;
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::System,
+            None,
+            "draft",
+            draft_id,
+            domain::EventType::DraftPosted,
+            serde_json::json!({ "review_id": draft.review_id, "posted_at": posted_at }),
+        ))
+        .await?;
+        Ok(draft)
     }
 
     async fn mark_draft_post_failed(
@@ -661,17 +974,24 @@ impl Repository for PgRepository {
         draft_id: Uuid,
         error: String,
     ) -> RepositoryResult<ReplyDraft> {
+        let now = OffsetDateTime::now_utc();
         let res = sqlx::query(
             r"
             update reply_drafts
             set state = 'failed',
                 platform_post_error = $1,
                 post_eligible_at = null
-            where id = $2 and state in ('approved','approved_pending_undo')
+            where id = $2
+              and state in ('approved','approved_pending_undo')
+              and (
+                state <> 'approved_pending_undo'
+                or (post_eligible_at is not null and $3 >= post_eligible_at)
+              )
             ",
         )
         .bind(error)
         .bind(draft_id)
+        .bind(now)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Storage(e.to_string()))?;
@@ -683,7 +1003,17 @@ impl Repository for PgRepository {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
-        draft_from_row(row)
+        let draft = draft_from_row(row)?;
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::System,
+            None,
+            "draft",
+            draft_id,
+            domain::EventType::DraftPostFailed,
+            serde_json::json!({ "review_id": draft.review_id }),
+        ))
+        .await?;
+        Ok(draft)
     }
 }
 

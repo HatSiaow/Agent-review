@@ -77,6 +77,60 @@ impl Store {
         let _ = self.repo.ingest_review(review).await;
     }
 
+    pub async fn get_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+    ) -> Option<time::OffsetDateTime> {
+        self.repo.get_reviews_sync_state(platform).await.ok().flatten()
+    }
+
+    pub async fn set_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+        last_seen_update_time: time::OffsetDateTime,
+    ) {
+        let _ = self
+            .repo
+            .set_reviews_sync_state(platform, last_seen_update_time)
+            .await;
+    }
+
+    pub async fn register_webhook_event(
+        &self,
+        platform: domain::Platform,
+        event_id: &str,
+        received_at: time::OffsetDateTime,
+    ) -> bool {
+        self.repo
+            .register_webhook_event(platform, event_id, received_at)
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn get_idempotency_response(
+        &self,
+        idempotency_key: &str,
+    ) -> Option<(u16, serde_json::Value)> {
+        self.repo
+            .get_idempotency_response(idempotency_key)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn put_idempotency_response(
+        &self,
+        idempotency_key: &str,
+        status: u16,
+        body_json: serde_json::Value,
+        created_at: time::OffsetDateTime,
+    ) {
+        let _ = self
+            .repo
+            .put_idempotency_response(idempotency_key, status, body_json, created_at)
+            .await;
+    }
+
     pub async fn store_agent_draft(&self, draft: ReplyDraft) {
         let _ = self.repo.store_agent_draft(draft).await;
     }

@@ -3,20 +3,15 @@
 Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest). File paths/specs are referenced so each item is actionable.
 
 - **P0 — Secure, correct human-in-the-loop posting (must-have before “real” use)**
-  - **Implement real auth + sessions + CSRF + RBAC (owner/manager/viewer)** per `specs/coder/09-auth-and-secrets.md`, `specs/coder/06-human-in-the-loop-workflow.md`, `specs/coder/11-api-design.md`, `specs/coder/16-frontend-web-ui.md`.
-    - Current gaps: no login/session middleware, no CSRF, no RBAC checks; mutation endpoints accept optional `user_id` in body.
-    - Code: `crates/api/src/lib.rs`, `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs}`, `crates/storage/migrations/0001_init.sql`.
+  - **Implement real auth + sessions (owner/manager/viewer)** per `specs/coder/09-auth-and-secrets.md`, `specs/coder/06-human-in-the-loop-workflow.md`, `specs/coder/11-api-design.md`, `specs/coder/16-frontend-web-ui.md`.
+    - Remaining: login/session middleware + user identity derivation (stop accepting `user_id` in request bodies), role assignment UX/admin path, and end-to-end coverage.
+    - Code: `crates/api/src/lib.rs`, `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs}`.
   - **Implement secrets backend + encryption-at-rest plumbing** (the `Secrets` trait + `EnvFileSecrets`(age) + cloud backends + envelope encryption helper) per `specs/coder/09-auth-and-secrets.md` and `specs/coder/15-security-privacy-compliance.md`.
     - Current gaps: no `Secrets` trait/implementations found in code; sensitive columns (e.g. `users.totp_secret`) are plaintext; adapters/LLM client read raw strings from env/config.
     - Code: new crate/module (likely `crates/common` or a new `crates/secrets` + `crates/encryption`), plus storage migrations updates.
-  - **Idempotency for mutating endpoints** (`Idempotency-Key` caching 24h) + webhook replay protection per `specs/coder/11-api-design.md` and `specs/coder/15-security-privacy-compliance.md`.
-    - Code: `crates/api/src/v1.rs`, (new storage table or reuse outbox/idempotency store).
   - **Posting must be gated on explicit human approval, with correct state transitions and auditing** per `specs/coder/06-human-in-the-loop-workflow.md`.
     - Add missing transitions/guards in `domain` FSMs and enforce server-side (not just UI).
     - Code: `crates/domain/src/{fsm.rs,review_fsm.rs,audit.rs}`, `crates/api/src/v1.rs`, `crates/poster/src/lib.rs`, `crates/server/src/main.rs`.
-  - **Bulk approve 10-second undo window** (backend-represented; posting must not begin until window closes) per `specs/coder/06-human-in-the-loop-workflow.md` and `specs/coder/16-frontend-web-ui.md`.
-    - Current: `server` posts immediately for `Approved` drafts.
-    - Code: `crates/server/src/main.rs`, `crates/domain/src/fsm.rs`, `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs}`.
   - **Fix Problem Details to be RFC 9457-aligned** (content-type `application/problem+json`, proper `instance`, consistent mapping of validation errors) per `specs/coder/11-api-design.md`.
     - Code: `crates/api/src/problem.rs`, `crates/api/src/v1.rs`.
 
@@ -24,11 +19,6 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Make storage schema + repo behavior match the specs** (`model_version`, defaults, indexes, constraints, proper tables) per `specs/coder/08-data-storage.md` and `specs/coder/04-unified-review-data-model.md`.
     - Biggest mismatches: `agent_runs`, `notifications_outbox`, `reviews_sync_state`, `users` columns/constraints, missing defaults/indexes.
     - Code: `crates/storage/migrations/0001_init.sql`, `crates/storage/src/pg.rs`.
-  - **Implement real migrations runner** (spec says `refinery`; current `PgRepository::migrate()` is stubbed) per `specs/coder/08-data-storage.md`, `specs/coder/13-deployment-infra.md`.
-    - Code: `crates/storage/src/pg.rs`, `crates/cli/src/main.rs`.
-  - **Implement spec-compliant upsert/dedup on `(platform, source_review_id)` with update semantics** (refresh raw payload, reprocess on newer `updated_at`, emit drift events when content changes) per `specs/coder/04-unified-review-data-model.md`.
-    - Current: both memory+pg paths effectively “do nothing on conflict”.
-    - Code: `crates/storage/src/{pg.rs,memory.rs}`, `crates/ingestion/src/lib.rs`.
   - **Retention / `storage_gc` job** (raw_payload redaction after 90d; agent_runs 180d; etc.) per `specs/coder/08-data-storage.md` and `specs/coder/15-security-privacy-compliance.md`.
     - Code: new worker/binary path (likely `crates/server` role + `crates/storage` SQL helpers).
 
@@ -45,7 +35,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Current `crates/server/src/main.rs` polls `list_reviews/list_drafts` every 2s and uses in-memory de-dupe; no durable queues/outbox claims.
     - Code: `crates/server/src/main.rs`, `crates/storage`, plus new queue/outbox abstractions.
   - **Ingestion orchestration** (Google polling with stop-at-watermark; UberEats webhook enqueues + polling fallback “since last created_at”; per-location sync state) per `specs/coder/02-google-reviews-integration.md`, `specs/coder/03-ubereats-reviews-integration.md`.
-    - Current `crates/ingestion` is mostly in-memory logic; adapters exist but watermark + per-location sync are missing.
+    - Remaining: “enqueue + polling fallback” orchestration, DLQ behaviors, and per-location fanout/locking (watermark persistence is now in place).
     - Code: `crates/ingestion/src/lib.rs`, `crates/adapters/{google,ubereats}/src/lib.rs`, `crates/api/src/webhooks.rs`, `crates/storage/src/{pg.rs,repo.rs}`.
   - **Poster worker correctness** (idempotent posting, drift detection, retries persisted, surface platform rejections) per `specs/coder/01-architecture.md` and platform specs (`02`, `03`).
     - Current: retries exist but no durable job records; drift detection is largely missing.
@@ -102,4 +92,24 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Finish CLI operational commands** (`google-auth` flow, token rotation, migrate status, replay tools) per `specs/coder/09-auth-and-secrets.md`, `specs/coder/08-data-storage.md`, `specs/coder/10-rust-tech-stack.md`.
     - Current: `google-auth` and `migrate status` are placeholders.
     - Code: `crates/cli/src/main.rs`.
+
+- **Completed (this session)**
+  - **Storage upsert semantics for reviews (pg + memory)**: switched to “update on conflict” semantics (no more `DO NOTHING`); refreshes stored review data when a duplicate `(platform, source_review_id)` arrives.
+    - Code: `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **Google polling stop-at-watermark persisted via `reviews_sync_state`**: persist/read watermark so polling stops correctly and resumes without re-scanning.
+    - Code: `crates/storage/src/{pg.rs,repo.rs}`, `crates/api/src/store.rs`
+  - **UberEats webhook replay protection (event_id or sha256 fallback) + tests**: dedupe webhook deliveries using provider `event_id` when present, else a sha256 fallback; added coverage around replay behavior.
+    - Code: `crates/api/src/webhooks.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **Enforce bulk approve 10s undo window gating (backend + repo guard)**: prevent posting/processing until the undo window has elapsed; added repo-level guard so workers can’t bypass API/UI timing.
+    - Code: `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/server/src/main.rs`
+  - **Audit events writing (pg + memory) + ability to list audit events**: write audit rows for key mutations and expose read/list capability.
+    - Code: `crates/domain/src/audit.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/api/src/v1.rs`
+  - **Minimal RBAC (viewer read-only) + CSRF double-submit checks for mutating endpoints**: added “viewer cannot mutate” enforcement and CSRF double-submit verification on write routes.
+    - Code: `crates/api/src/v1.rs`
+  - **Idempotency-Key caching for approve/reject/bulk/undo (repo-backed) + migrations**: persist idempotency keys to prevent duplicate mutations; added schema changes.
+    - Migrations: `crates/storage/migrations/0003_idempotency_keys.sql`
+    - Code: `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **Implement migrations runner (embedded migrations) and update CLI to await**: embedded migrations and ensured CLI blocks until migrations complete.
+    - Migrations: `crates/storage/migrations/0002_webhook_events.sql`, `crates/storage/migrations/0003_idempotency_keys.sql`
+    - Code: `crates/storage/src/pg.rs`, `crates/server/src/main.rs`
 

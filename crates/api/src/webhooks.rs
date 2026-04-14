@@ -6,6 +6,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
+use sha2::Digest as _;
 
 use crate::Store;
 
@@ -53,6 +54,27 @@ async fn ubereats_webhook(
 
     let event_type = payload["event_type"].as_str().unwrap_or("unknown");
     tracing::info!(event_type, "received UberEats webhook");
+
+    // Replay protection: use provided event id when present; otherwise fall back to a stable hash
+    // of the raw body (still useful against retry storms for identical payloads).
+    let event_id = payload
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&body);
+            format!("sha256:{}", hex::encode(hasher.finalize()))
+        });
+    let is_first = state
+        .store
+        .register_webhook_event(domain::Platform::Ubereats, &event_id, time::OffsetDateTime::now_utc())
+        .await;
+    if !is_first {
+        tracing::info!(event_type, event_id, "duplicate UberEats webhook event ignored");
+        return StatusCode::OK;
+    }
 
     if event_type == "store.review_created" {
         let review_data = if payload.get("review").is_some() {
@@ -190,5 +212,45 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let reviews = store.list_reviews().await;
         assert!(reviews.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ubereats_webhook_dedupes_replayed_event_id() {
+        let store = Store::new();
+        let app = build_router(store.clone());
+
+        let body = serde_json::json!({
+            "event_type": "store.review_created",
+            "event_id": "evt-1",
+            "review": {
+                "review_uuid": "ue-webhook-test-dup",
+                "store_uuid": "store-abc",
+                "eater": { "first_name": "Marco" },
+                "rating": { "overall": 4 },
+                "comment": { "text": "Good food", "language": "en" },
+                "created_at": "2026-04-10T14:30:00Z"
+            }
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+
+        for _ in 0..2 {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/webhooks/ubereats")
+                        .header("content-type", "application/json")
+                        .body(Body::from(bytes.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        let reviews = store.list_reviews().await;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].0.source_review_id, "ue-webhook-test-dup");
     }
 }

@@ -43,6 +43,13 @@ fn spawn_workers(store: api::Store, cancel: CancellationToken) {
     tokio::spawn(notifier_worker(store, cancel));
 }
 
+fn should_process_google_review(
+    last_seen: Option<time::OffsetDateTime>,
+    review_updated_at: time::OffsetDateTime,
+) -> bool {
+    last_seen.is_none_or(|cursor| review_updated_at > cursor)
+}
+
 async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
     let google_cfg = adapter_google::GoogleConfig::default();
     let ubereats_cfg = adapter_ubereats::UberEatsConfig::default();
@@ -61,13 +68,22 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
             _ = google_tick.tick() => {
                 let cfg = google_cfg.clone();
                 let store2 = store.clone();
+                let last_seen = store2.get_reviews_sync_state(domain::Platform::Google).await;
                 if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
                     adapter_google::HttpGoogleClient::new().list_reviews(&cfg)
                 }).await {
+                    let mut max_seen: Option<time::OffsetDateTime> = last_seen;
                     for raw in raws {
                         if let Ok(review) = adapter_google::normalize_google_review(&raw) {
+                            if !should_process_google_review(last_seen, review.updated_at) {
+                                break; // stop-at-watermark
+                            }
+                            max_seen = Some(max_seen.map_or(review.updated_at, |m| m.max(review.updated_at)));
                             store2.ingest_review(review).await;
                         }
+                    }
+                    if let Some(max_seen) = max_seen {
+                        store2.set_reviews_sync_state(domain::Platform::Google, max_seen).await;
                     }
                 }
             }
@@ -131,6 +147,25 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn google_stop_at_watermark_allows_strictly_newer() {
+        let cursor = Some(datetime!(2026-04-10 12:00:00 UTC));
+        assert!(should_process_google_review(cursor, datetime!(2026-04-10 12:00:01 UTC)));
+        assert!(!should_process_google_review(cursor, datetime!(2026-04-10 12:00:00 UTC)));
+        assert!(!should_process_google_review(cursor, datetime!(2026-04-10 11:59:59 UTC)));
+    }
+
+    #[test]
+    fn google_stop_at_watermark_with_no_cursor_processes_all() {
+        assert!(should_process_google_review(None, datetime!(2026-04-10 12:00:00 UTC)));
     }
 }
 

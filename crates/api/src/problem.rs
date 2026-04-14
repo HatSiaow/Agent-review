@@ -22,6 +22,8 @@ pub enum ApiError {
     InvalidTransition,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
     #[error("bad request: {0}")]
     BadRequest(&'static str),
 }
@@ -32,6 +34,7 @@ impl ApiError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidTransition => StatusCode::CONFLICT,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
         }
     }
@@ -41,6 +44,7 @@ impl ApiError {
             Self::NotFound => "not_found",
             Self::InvalidTransition => "invalid_transition",
             Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
             Self::BadRequest(_) => "bad_request",
         }
     }
@@ -50,6 +54,7 @@ impl ApiError {
             Self::NotFound => "https://agent-review/errors/not-found",
             Self::InvalidTransition => "https://agent-review/errors/invalid-transition",
             Self::Unauthorized => "https://agent-review/errors/unauthorized",
+            Self::Forbidden => "https://agent-review/errors/forbidden",
             Self::BadRequest(_) => "https://agent-review/errors/bad-request",
         }
     }
@@ -62,6 +67,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => "Not found",
             Self::InvalidTransition => "Invalid state transition",
             Self::Unauthorized => "Unauthorized",
+            Self::Forbidden => "Forbidden",
             Self::BadRequest(msg) => msg,
         };
 

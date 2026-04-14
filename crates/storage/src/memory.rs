@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use domain::{
-    DraftEvent, DraftFsm, Generator, ReplyDraft, Review, ReviewEvent, ReviewFsm, ReviewStatus,
+    ActorType, AuditEvent, DraftEvent, DraftFsm, EventType, Generator, ReplyDraft, Review,
+    ReviewEvent, ReviewFsm, ReviewStatus,
 };
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -18,6 +19,10 @@ struct State {
     reviews: HashMap<Uuid, Review>,
     drafts: HashMap<Uuid, ReplyDraft>,
     review_to_active_draft: HashMap<Uuid, Uuid>,
+    reviews_sync_state: HashMap<domain::Platform, time::OffsetDateTime>,
+    webhook_events: HashMap<(domain::Platform, String), time::OffsetDateTime>,
+    audit_events: Vec<AuditEvent>,
+    idempotency_responses: HashMap<String, (u16, serde_json::Value, time::OffsetDateTime)>,
 }
 
 impl InMemoryRepository {
@@ -59,13 +64,56 @@ impl Repository for InMemoryRepository {
 
     async fn ingest_review(&self, review: Review) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
-        let existing = state.reviews.values().any(|r| {
-            r.platform == review.platform && r.source_review_id == review.source_review_id
-        });
-        if existing {
+        let existing_id = state
+            .reviews
+            .iter()
+            .find_map(|(id, r)| {
+                (r.platform == review.platform && r.source_review_id == review.source_review_id)
+                    .then_some(*id)
+            });
+
+        if let Some(existing_id) = existing_id {
+            let Some(existing) = state.reviews.get_mut(&existing_id) else {
+                return Ok(());
+            };
+
+            // Storage-level upsert semantics:
+            // - always preserve the canonical UUID primary key
+            // - update when the incoming review is newer or materially changed
+            let newer = review.updated_at > existing.updated_at;
+            let changed = existing.body_text != review.body_text
+                || existing.rating != review.rating
+                || existing.existing_reply_text != review.existing_reply_text
+                || existing.existing_reply_updated_at != review.existing_reply_updated_at;
+
+            if newer || changed {
+                let drift = existing.body_text != review.body_text;
+                let mut incoming = review;
+                incoming.id = existing_id;
+                *existing = incoming;
+
+                state.audit_events.push(AuditEvent::new(
+                    ActorType::System,
+                    None,
+                    "review",
+                    existing_id,
+                    if drift { EventType::DriftDetected } else { EventType::ReviewIngested },
+                    serde_json::json!({ "updated": true }),
+                ));
+            }
             return Ok(());
         }
-        state.reviews.insert(review.id, review);
+
+        let review_id = review.id;
+        state.reviews.insert(review_id, review);
+        state.audit_events.push(AuditEvent::new(
+            ActorType::System,
+            None,
+            "review",
+            review_id,
+            EventType::ReviewIngested,
+            serde_json::json!({ "created": true }),
+        ));
         Ok(())
     }
 
@@ -74,6 +122,84 @@ impl Repository for InMemoryRepository {
         state.review_to_active_draft.insert(review.id, draft.id);
         state.reviews.insert(review.id, review);
         state.drafts.insert(draft.id, draft);
+        Ok(())
+    }
+
+    async fn get_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+    ) -> RepositoryResult<Option<time::OffsetDateTime>> {
+        let state = self.0.lock().await;
+        Ok(state.reviews_sync_state.get(&platform).copied())
+    }
+
+    async fn set_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+        last_seen_update_time: time::OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        state.reviews_sync_state.insert(platform, last_seen_update_time);
+        Ok(())
+    }
+
+    async fn register_webhook_event(
+        &self,
+        platform: domain::Platform,
+        event_id: &str,
+        received_at: time::OffsetDateTime,
+    ) -> RepositoryResult<bool> {
+        let mut state = self.0.lock().await;
+
+        // Simple TTL cleanup (24h) to keep memory bounded in tests/dev.
+        let cutoff = received_at - time::Duration::hours(24);
+        state.webhook_events.retain(|_, t| *t >= cutoff);
+
+        let key = (platform, event_id.to_string());
+        if state.webhook_events.contains_key(&key) {
+            return Ok(false);
+        }
+        state.webhook_events.insert(key, received_at);
+        Ok(true)
+    }
+
+    async fn list_audit_events(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> RepositoryResult<Vec<domain::AuditEvent>> {
+        let state = self.0.lock().await;
+        Ok(state
+            .audit_events
+            .iter()
+            .filter(|e| e.entity_type == entity_type && e.entity_id == entity_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_idempotency_response(
+        &self,
+        idempotency_key: &str,
+    ) -> RepositoryResult<Option<(u16, serde_json::Value)>> {
+        let state = self.0.lock().await;
+        Ok(state
+            .idempotency_responses
+            .get(idempotency_key)
+            .map(|(status, body, _)| (*status, body.clone())))
+    }
+
+    async fn put_idempotency_response(
+        &self,
+        idempotency_key: &str,
+        status: u16,
+        body_json: serde_json::Value,
+        created_at: time::OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        state
+            .idempotency_responses
+            .entry(idempotency_key.to_string())
+            .or_insert((status, body_json, created_at));
         Ok(())
     }
 
@@ -104,7 +230,16 @@ impl Repository for InMemoryRepository {
             .apply(ReviewEvent::Skip)
             .map_err(|_| RepositoryError::InvalidTransition)?;
         review.status = fsm.state();
-        Ok(review.clone())
+        let out = review.clone();
+        state.audit_events.push(AuditEvent::new(
+            ActorType::System,
+            None,
+            "review",
+            review_id,
+            EventType::ReviewSkipped,
+            serde_json::json!({}),
+        ));
+        Ok(out)
     }
 
     async fn unskip_review(&self, review_id: Uuid) -> RepositoryResult<Review> {
@@ -117,7 +252,16 @@ impl Repository for InMemoryRepository {
             .apply(ReviewEvent::Unskip)
             .map_err(|_| RepositoryError::InvalidTransition)?;
         review.status = fsm.state();
-        Ok(review.clone())
+        let out = review.clone();
+        state.audit_events.push(AuditEvent::new(
+            ActorType::System,
+            None,
+            "review",
+            review_id,
+            EventType::ReviewUnskipped,
+            serde_json::json!({}),
+        ));
+        Ok(out)
     }
 
     async fn list_drafts(&self) -> RepositoryResult<Vec<ReplyDraft>> {
@@ -128,11 +272,20 @@ impl Repository for InMemoryRepository {
     async fn store_agent_draft(&self, draft: ReplyDraft) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
         let review_id = draft.review_id;
+        let draft_id = draft.id;
         state.review_to_active_draft.insert(review_id, draft.id);
         state.drafts.insert(draft.id, draft);
         if let Some(review) = state.reviews.get_mut(&review_id) {
             review.status = ReviewStatus::AwaitingHuman;
         }
+        state.audit_events.push(AuditEvent::new(
+            ActorType::Agent,
+            None,
+            "draft",
+            draft_id,
+            EventType::DraftCreated,
+            serde_json::json!({ "review_id": review_id }),
+        ));
         Ok(())
     }
 
@@ -143,6 +296,7 @@ impl Repository for InMemoryRepository {
         new_text: Option<String>,
     ) -> RepositoryResult<ReplyDraft> {
         let mut state = self.0.lock().await;
+        let was_edited = new_text.is_some();
         let (review_id, updated) = {
             let draft = state
                 .drafts
@@ -176,6 +330,19 @@ impl Repository for InMemoryRepository {
             review.status = ReviewStatus::AwaitingHuman;
         }
 
+        state.audit_events.push(AuditEvent::new(
+            ActorType::User,
+            Some(reviewed_by),
+            "draft",
+            draft_id,
+            if was_edited {
+                EventType::DraftEdited
+            } else {
+                EventType::DraftApproved
+            },
+            serde_json::json!({ "review_id": review_id }),
+        ));
+
         Ok(updated)
     }
 
@@ -198,7 +365,16 @@ impl Repository for InMemoryRepository {
         draft.reviewed_by = Some(reviewed_by);
         draft.reviewed_at = Some(OffsetDateTime::now_utc());
         draft.rejection_reason = Some(reason);
-        Ok(draft.clone())
+        let out = draft.clone();
+        state.audit_events.push(AuditEvent::new(
+            ActorType::User,
+            Some(reviewed_by),
+            "draft",
+            draft_id,
+            EventType::DraftRejected,
+            serde_json::json!({}),
+        ));
+        Ok(out)
     }
 
     async fn bulk_approve(
@@ -239,6 +415,15 @@ impl Repository for InMemoryRepository {
             draft.reviewed_at = Some(now);
             draft.post_eligible_at = Some(post_eligible_at);
             results.push(draft.clone());
+
+            state.audit_events.push(AuditEvent::new(
+                ActorType::User,
+                Some(reviewed_by),
+                "draft",
+                draft_id,
+                EventType::DraftApproved,
+                serde_json::json!({ "bulk": true }),
+            ));
         }
 
         Ok(results)
@@ -292,13 +477,31 @@ impl Repository for InMemoryRepository {
             .drafts
             .get_mut(&draft_id)
             .ok_or(RepositoryError::NotFound)?;
+        if draft.state == domain::DraftState::ApprovedPendingUndo {
+            if let Some(t) = draft.post_eligible_at {
+                if posted_at < t {
+                    return Err(RepositoryError::InvalidTransition);
+                }
+            } else {
+                return Err(RepositoryError::InvalidTransition);
+            }
+        }
         let fsm = DraftFsm::new(draft.state)
             .apply(DraftEvent::MarkPosted)
             .map_err(|_| RepositoryError::InvalidTransition)?;
         draft.state = fsm.state();
         draft.posted_at = Some(posted_at);
         draft.post_eligible_at = None;
-        Ok(draft.clone())
+        let out = draft.clone();
+        state.audit_events.push(AuditEvent::new(
+            ActorType::System,
+            None,
+            "draft",
+            draft_id,
+            EventType::DraftPosted,
+            serde_json::json!({ "posted_at": posted_at }),
+        ));
+        Ok(out)
     }
 
     async fn mark_draft_post_failed(
@@ -311,13 +514,219 @@ impl Repository for InMemoryRepository {
             .drafts
             .get_mut(&draft_id)
             .ok_or(RepositoryError::NotFound)?;
+        if draft.state == domain::DraftState::ApprovedPendingUndo {
+            let now = OffsetDateTime::now_utc();
+            if let Some(t) = draft.post_eligible_at {
+                if now < t {
+                    return Err(RepositoryError::InvalidTransition);
+                }
+            } else {
+                return Err(RepositoryError::InvalidTransition);
+            }
+        }
         let fsm = DraftFsm::new(draft.state)
             .apply(DraftEvent::MarkFailed)
             .map_err(|_| RepositoryError::InvalidTransition)?;
         draft.state = fsm.state();
         draft.platform_post_error = Some(error);
         draft.post_eligible_at = None;
-        Ok(draft.clone())
+        let out = draft.clone();
+        state.audit_events.push(AuditEvent::new(
+            ActorType::System,
+            None,
+            "draft",
+            draft_id,
+            EventType::DraftPostFailed,
+            serde_json::json!({}),
+        ));
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::{Platform, ReviewAuthor, ReviewStatus};
+    use serde_json::json;
+    use time::macros::datetime;
+
+    fn make_review(source_id: &str) -> Review {
+        Review {
+            id: Uuid::new_v4(),
+            platform: Platform::Google,
+            source_review_id: source_id.into(),
+            source_location_id: "loc-1".into(),
+            author: ReviewAuthor {
+                display_name: "Maria".into(),
+                avatar_url: None,
+            },
+            rating: 5,
+            body_text: Some("Great".into()),
+            body_language: Some("en".into()),
+            created_at: datetime!(2026-04-10 12:00:00 UTC),
+            updated_at: datetime!(2026-04-10 12:00:00 UTC),
+            ingested_at: datetime!(2026-04-10 12:01:00 UTC),
+            existing_reply_text: None,
+            existing_reply_updated_at: None,
+            status: ReviewStatus::New,
+            context_json: json!({}),
+            raw_payload: json!({"v":1}),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_review_updates_existing_when_newer() {
+        let repo = InMemoryRepository::new();
+        let r1 = make_review("r1");
+        repo.ingest_review(r1.clone()).await.unwrap();
+
+        let mut r2 = make_review("r1");
+        r2.rating = 4;
+        r2.updated_at = datetime!(2026-04-11 12:00:00 UTC);
+        r2.raw_payload = json!({"v":2});
+
+        repo.ingest_review(r2).await.unwrap();
+
+        let items = repo.list_reviews().await.unwrap();
+        assert_eq!(items.len(), 1);
+        let (stored, _) = &items[0];
+        assert_eq!(stored.rating, 4);
+        assert_eq!(stored.raw_payload, json!({"v":2}));
+        // Canonical id is preserved (upsert does not create a second review)
+        assert_eq!(stored.id, r1.id);
+    }
+
+    #[tokio::test]
+    async fn ingest_review_does_not_create_duplicate_for_same_platform_and_source_id() {
+        let repo = InMemoryRepository::new();
+        let r1 = make_review("r1");
+        repo.ingest_review(r1.clone()).await.unwrap();
+
+        let mut r2 = make_review("r1");
+        r2.id = Uuid::new_v4();
+        repo.ingest_review(r2).await.unwrap();
+
+        let items = repo.list_reviews().await.unwrap();
+        assert_eq!(items.len(), 1);
+        let (stored, _) = &items[0];
+        assert_eq!(stored.id, r1.id);
+    }
+
+    #[tokio::test]
+    async fn reviews_sync_state_roundtrips() {
+        let repo = InMemoryRepository::new();
+        assert!(repo
+            .get_reviews_sync_state(Platform::Google)
+            .await
+            .unwrap()
+            .is_none());
+
+        let t = datetime!(2026-04-12 08:00:00 UTC);
+        repo.set_reviews_sync_state(Platform::Google, t).await.unwrap();
+        assert_eq!(
+            repo.get_reviews_sync_state(Platform::Google).await.unwrap(),
+            Some(t)
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_replay_protection_dedupes() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-12 08:00:00 UTC);
+        assert!(repo
+            .register_webhook_event(Platform::Ubereats, "evt-1", now)
+            .await
+            .unwrap());
+        assert!(!repo
+            .register_webhook_event(Platform::Ubereats, "evt-1", now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn audit_events_are_written_for_review_and_draft_actions() {
+        let repo = InMemoryRepository::new();
+        let review = make_review("r1");
+        let review_id = review.id;
+        repo.ingest_review(review).await.unwrap();
+
+        let events = repo.list_audit_events("review", review_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, domain::EventType::ReviewIngested);
+
+        let draft = domain::ReplyDraft {
+            id: Uuid::new_v4(),
+            review_id,
+            generated_by: domain::Generator::AgentLlm,
+            model_name: None,
+            prompt_fingerprint: None,
+            text: "Thanks!".into(),
+            language: "en".into(),
+            char_count: 7,
+            state: domain::DraftState::PendingReview,
+            guardrail_warnings: vec![],
+            flags: vec![],
+            created_at: datetime!(2026-04-12 08:00:00 UTC),
+            reviewed_by: None,
+            reviewed_at: None,
+            rejection_reason: None,
+            post_eligible_at: None,
+            posted_at: None,
+            platform_post_error: None,
+        };
+        let draft_id = draft.id;
+        repo.store_agent_draft(draft).await.unwrap();
+
+        let events = repo.list_audit_events("draft", draft_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, domain::EventType::DraftCreated);
+    }
+
+    #[tokio::test]
+    async fn bulk_approve_undo_window_gates_posting() {
+        let repo = InMemoryRepository::new();
+        let review = make_review("r1");
+        let review_id = review.id;
+        repo.ingest_review(review).await.unwrap();
+
+        let draft_id = Uuid::new_v4();
+        let draft = domain::ReplyDraft {
+            id: draft_id,
+            review_id,
+            generated_by: domain::Generator::AgentLlm,
+            model_name: None,
+            prompt_fingerprint: None,
+            text: "Thanks!".into(),
+            language: "en".into(),
+            char_count: 7,
+            state: domain::DraftState::PendingReview,
+            guardrail_warnings: vec![],
+            flags: vec![],
+            created_at: datetime!(2026-04-12 08:00:00 UTC),
+            reviewed_by: None,
+            reviewed_at: None,
+            rejection_reason: None,
+            post_eligible_at: None,
+            posted_at: None,
+            platform_post_error: None,
+        };
+        repo.store_agent_draft(draft).await.unwrap();
+
+        let reviewer = Uuid::new_v4();
+        let approved = repo.bulk_approve(&[draft_id], reviewer).await.unwrap();
+        let eligible_at = approved[0].post_eligible_at.expect("set by bulk_approve");
+
+        // Before eligible time: cannot mark posted.
+        assert!(matches!(
+            repo.mark_draft_posted(draft_id, eligible_at - time::Duration::seconds(1))
+                .await,
+            Err(RepositoryError::InvalidTransition)
+        ));
+
+        // After eligible time: can mark posted.
+        repo.mark_draft_posted(draft_id, eligible_at + time::Duration::seconds(1))
+            .await
+            .unwrap();
     }
 }
 

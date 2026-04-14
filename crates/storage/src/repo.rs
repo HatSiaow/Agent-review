@@ -1,5 +1,6 @@
 use domain::ReplyDraft;
 use domain::Review;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +29,59 @@ pub trait Repository: Send + Sync + 'static {
     async fn ingest_review(&self, review: Review) -> RepositoryResult<()>;
     async fn upsert_review_with_draft(&self, review: Review, draft: ReplyDraft)
         -> RepositoryResult<()>;
+
+    /// Get the last-seen update watermark for a platform sync.
+    ///
+    /// Used to implement "stop-at-cursor" polling for adapters that return results
+    /// ordered by most-recent `updated_at` (e.g., Google Business Profile).
+    async fn get_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+    ) -> RepositoryResult<Option<OffsetDateTime>>;
+
+    /// Persist the last-seen update watermark for a platform sync.
+    ///
+    /// Callers should write the maximum `updated_at` observed during a successful poll.
+    async fn set_reviews_sync_state(
+        &self,
+        platform: domain::Platform,
+        last_seen_update_time: OffsetDateTime,
+    ) -> RepositoryResult<()>;
+
+    /// Register a webhook delivery for replay protection.
+    ///
+    /// Returns `true` if this event id was not seen before (caller should process),
+    /// or `false` if it is a replay/duplicate (caller should no-op but still return 200).
+    ///
+    /// Implementations should retain the record for at least 24 hours.
+    async fn register_webhook_event(
+        &self,
+        platform: domain::Platform,
+        event_id: &str,
+        received_at: OffsetDateTime,
+    ) -> RepositoryResult<bool>;
+
+    /// List audit events for a specific entity.
+    async fn list_audit_events(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> RepositoryResult<Vec<domain::AuditEvent>>;
+
+    /// Get a previously-stored idempotent response payload for `idempotency_key`.
+    async fn get_idempotency_response(
+        &self,
+        idempotency_key: &str,
+    ) -> RepositoryResult<Option<(u16, serde_json::Value)>>;
+
+    /// Store an idempotent response payload for `idempotency_key` if not already present.
+    async fn put_idempotency_response(
+        &self,
+        idempotency_key: &str,
+        status: u16,
+        body_json: serde_json::Value,
+        created_at: OffsetDateTime,
+    ) -> RepositoryResult<()>;
 
     async fn transition_review_to_drafting(&self, review_id: Uuid) -> RepositoryResult<Review>;
     async fn skip_review(&self, review_id: Uuid) -> RepositoryResult<Review>;

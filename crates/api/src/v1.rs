@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use domain::ReplyDraft;
+use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -42,6 +43,78 @@ pub fn router(store: Store) -> Router {
         .route("/drafts/bulk-approve", post(bulk_approve))
         .route("/drafts/bulk-approve/undo", post(undo_bulk_approve))
         .with_state(state)
+}
+
+fn require_write_role(user: ActingUser) -> Result<(), ApiError> {
+    match user.role {
+        domain::UserRole::Owner | domain::UserRole::Manager => Ok(()),
+        domain::UserRole::Viewer => Err(ApiError::Forbidden),
+    }
+}
+
+fn require_csrf(headers: &HeaderMap) -> Result<(), ApiError> {
+    let header = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if header.is_empty() {
+        return Err(ApiError::Forbidden);
+    }
+
+    let cookie = headers
+        .get(http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let cookie_token = cookie
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("csrf_token="));
+    if cookie_token != Some(header) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+async fn maybe_idempotent_success<T: serde::de::DeserializeOwned>(
+    store: &Store,
+    headers: &HeaderMap,
+) -> Result<Option<T>, ApiError> {
+    let Some(key) = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some((status, body)) = store.get_idempotency_response(key).await else {
+        return Ok(None);
+    };
+    if status >= 400 {
+        return Err(ApiError::BadRequest("idempotent error replay not supported"));
+    }
+    serde_json::from_value(body)
+        .map(Some)
+        .map_err(|_| ApiError::BadRequest("bad idempotent cache payload"))
+}
+
+async fn store_idempotent_success<T: serde::Serialize>(
+    store: &Store,
+    headers: &HeaderMap,
+    body: &T,
+) {
+    let Some(key) = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return;
+    };
+    let Ok(value) = serde_json::to_value(body) else {
+        return;
+    };
+    store
+        .put_idempotency_response(key, 200, value, OffsetDateTime::now_utc())
+        .await;
 }
 
 // --- System endpoints ---
@@ -104,8 +177,11 @@ async fn get_review(
 async fn skip_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    _user: ActingUser,
+    user: ActingUser,
+    headers: HeaderMap,
 ) -> Result<Json<domain::Review>, ApiError> {
+    require_write_role(user)?;
+    require_csrf(&headers)?;
     let review = state.store.skip_review(id).await?;
     Ok(Json(review))
 }
@@ -113,8 +189,11 @@ async fn skip_review(
 async fn unskip_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    _user: ActingUser,
+    user: ActingUser,
+    headers: HeaderMap,
 ) -> Result<Json<domain::Review>, ApiError> {
+    require_write_role(user)?;
+    require_csrf(&headers)?;
     let review = state.store.unskip_review(id).await?;
     Ok(Json(review))
 }
@@ -137,9 +216,12 @@ struct RegenerateResponse {
 async fn regenerate_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    _user: ActingUser,
+    user: ActingUser,
+    headers: HeaderMap,
     Json(req): Json<RegenerateRequest>,
 ) -> Result<Json<RegenerateResponse>, ApiError> {
+    require_write_role(user)?;
+    require_csrf(&headers)?;
     let review = state.store.transition_review_to_drafting(id).await?;
     Ok(Json(RegenerateResponse {
         review_id: review.id,
@@ -160,7 +242,7 @@ struct ApproveRequest {
     text: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ApproveResponse {
     id: Uuid,
     state: domain::DraftState,
@@ -172,18 +254,24 @@ async fn approve_draft(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     user: ActingUser,
+    headers: HeaderMap,
     Json(req): Json<ApproveRequest>,
 ) -> Result<Json<ApproveResponse>, ApiError> {
-    if user.role == domain::UserRole::Viewer {
-        return Err(ApiError::Unauthorized);
+    require_write_role(user)?;
+    require_csrf(&headers)?;
+    if let Some(cached) = maybe_idempotent_success::<ApproveResponse>(&state.store, &headers).await?
+    {
+        return Ok(Json(cached));
     }
     let updated = state.store.approve_draft(id, user.id, req.text).await?;
 
-    Ok(Json(ApproveResponse {
+    let out = ApproveResponse {
         id: updated.id,
         state: updated.state,
         posted_at: updated.posted_at,
-    }))
+    };
+    store_idempotent_success(&state.store, &headers, &out).await;
+    Ok(Json(out))
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,12 +283,16 @@ async fn reject_draft(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     user: ActingUser,
+    headers: HeaderMap,
     Json(req): Json<RejectRequest>,
 ) -> Result<Json<ReplyDraft>, ApiError> {
-    if user.role == domain::UserRole::Viewer {
-        return Err(ApiError::Unauthorized);
+    require_write_role(user)?;
+    require_csrf(&headers)?;
+    if let Some(cached) = maybe_idempotent_success::<ReplyDraft>(&state.store, &headers).await? {
+        return Ok(Json(cached));
     }
     let updated = state.store.reject_draft(id, user.id, req.reason).await?;
+    store_idempotent_success(&state.store, &headers, &updated).await;
     Ok(Json(updated))
 }
 
@@ -212,12 +304,20 @@ struct BulkApproveRequest {
 async fn bulk_approve(
     State(state): State<AppState>,
     user: ActingUser,
+    headers: HeaderMap,
     Json(req): Json<BulkApproveRequest>,
 ) -> Result<Json<Vec<ReplyDraft>>, ApiError> {
+    require_write_role(user)?;
+    require_csrf(&headers)?;
     if user.role != domain::UserRole::Owner {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden);
+    }
+    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&state.store, &headers).await?
+    {
+        return Ok(Json(cached));
     }
     let updated = state.store.bulk_approve(&req.ids, user.id).await?;
+    store_idempotent_success(&state.store, &headers, &updated).await;
     Ok(Json(updated))
 }
 
@@ -229,15 +329,23 @@ struct UndoBulkApproveRequest {
 async fn undo_bulk_approve(
     State(state): State<AppState>,
     user: ActingUser,
+    headers: HeaderMap,
     Json(req): Json<UndoBulkApproveRequest>,
 ) -> Result<Json<Vec<ReplyDraft>>, ApiError> {
+    require_write_role(user)?;
+    require_csrf(&headers)?;
     if user.role != domain::UserRole::Owner {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::Forbidden);
+    }
+    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&state.store, &headers).await?
+    {
+        return Ok(Json(cached));
     }
     let updated = state
         .store
         .undo_bulk_approve(&req.ids, user.id, OffsetDateTime::now_utc())
         .await?;
+    store_idempotent_success(&state.store, &headers, &updated).await;
     Ok(Json(updated))
 }
 
@@ -256,9 +364,12 @@ mod tests {
     const TEST_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
     fn auth_headers(builder: http::request::Builder, role: &str) -> http::request::Builder {
+        let csrf = "test-csrf";
         builder
             .header("x-user-id", TEST_USER_ID)
             .header("x-user-role", role)
+            .header("x-csrf-token", csrf)
+            .header(http::header::COOKIE, format!("csrf_token={csrf}"))
     }
 
     fn make_review_and_draft() -> (Uuid, Review, ReplyDraft) {
@@ -414,6 +525,42 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn approve_is_idempotent_with_idempotency_key() {
+        let (store, _, draft_id) = seeded_store();
+        let app = build_router(store.clone());
+        let body = serde_json::to_string(&json!({})).unwrap();
+
+        let req = auth_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/drafts/{draft_id}/approve"))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "idem-1"),
+            "owner",
+        )
+        .body(Body::from(body.clone()))
+        .unwrap();
+
+        let res1 = oneshot(app, req);
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        // Second call would normally be an invalid transition, but should replay cached response.
+        let app2 = build_router(store);
+        let req2 = auth_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/drafts/{draft_id}/approve"))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "idem-1"),
+            "owner",
+        )
+        .body(Body::from(body))
+        .unwrap();
+        let res2 = oneshot(app2, req2);
+        assert_eq!(res2.status(), StatusCode::OK);
     }
 
     #[test]
