@@ -46,7 +46,7 @@ impl PgRepository {
         &self.pool
     }
 
-    pub async fn migrate(&self) -> Result<(), sqlx::Error> {
+    pub fn migrate(&self) -> Result<(), sqlx::Error> {
         // NOTE: Intentionally minimal; we use raw SQL migrations in this crate.
         // In a follow-up we can switch to an embedded migrator.
         //
@@ -245,7 +245,7 @@ impl Repository for PgRepository {
         let avatar_url = _review.author.avatar_url.as_ref().map(ToString::to_string);
 
         let res = sqlx::query(
-            r#"
+            r"
             insert into reviews (
               id, platform, source_review_id, source_location_id,
               author_display_name, author_avatar_url, rating,
@@ -262,7 +262,7 @@ impl Repository for PgRepository {
               $15,$16,$17
             )
             on conflict (platform, source_review_id) do nothing
-            "#,
+            ",
         )
         .bind(_review.id)
         .bind(platform)
@@ -303,7 +303,7 @@ impl Repository for PgRepository {
 
     async fn transition_review_to_drafting(&self, _review_id: Uuid) -> RepositoryResult<Review> {
         let res = sqlx::query(
-            r#"update reviews set status = 'drafting' where id = $1 and status in ('new','awaiting_human','skipped')"#,
+            r"update reviews set status = 'drafting' where id = $1 and status in ('new','awaiting_human','skipped')",
         )
         .bind(_review_id)
         .execute(&self.pool)
@@ -318,7 +318,7 @@ impl Repository for PgRepository {
 
     async fn skip_review(&self, _review_id: Uuid) -> RepositoryResult<Review> {
         let res = sqlx::query(
-            r#"update reviews set status = 'skipped' where id = $1 and status in ('new','awaiting_human','drafting')"#,
+            r"update reviews set status = 'skipped' where id = $1 and status in ('new','awaiting_human','drafting')",
         )
         .bind(_review_id)
         .execute(&self.pool)
@@ -332,7 +332,7 @@ impl Repository for PgRepository {
     }
 
     async fn unskip_review(&self, _review_id: Uuid) -> RepositoryResult<Review> {
-        let res = sqlx::query(r#"update reviews set status = 'new' where id = $1 and status = 'skipped'"#)
+        let res = sqlx::query(r"update reviews set status = 'new' where id = $1 and status = 'skipped'")
             .bind(_review_id)
             .execute(&self.pool)
             .await
@@ -356,7 +356,7 @@ impl Repository for PgRepository {
         let gen = _draft.generated_by.to_string();
         let state = _draft.state.to_string();
         sqlx::query(
-            r#"
+            r"
             insert into reply_drafts (
               id, review_id, generated_by, model_name, prompt_fingerprint,
               text, language, char_count, state,
@@ -372,7 +372,7 @@ impl Repository for PgRepository {
               $13,$14,$15,
               $16,$17
             )
-            "#,
+            ",
         )
         .bind(_draft.id)
         .bind(_draft.review_id)
@@ -414,14 +414,14 @@ impl Repository for PgRepository {
         if let Some(text) = _new_text {
             let char_count = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
             let res = sqlx::query(
-                r#"
+                r"
                 update reply_drafts
                 set text = $1,
                     char_count = $2,
                     state = 'edited',
                     generated_by = 'human_edit'
                 where id = $3
-                "#,
+                ",
             )
             .bind(text)
             .bind(char_count)
@@ -436,13 +436,13 @@ impl Repository for PgRepository {
 
         let now = OffsetDateTime::now_utc();
         let res = sqlx::query(
-            r#"
+            r"
             update reply_drafts
             set state = 'approved',
                 reviewed_by = $1,
                 reviewed_at = $2
             where id = $3 and state in ('pending_review','edited')
-            "#,
+            ",
         )
         .bind(_reviewed_by)
         .bind(now)
@@ -470,14 +470,14 @@ impl Repository for PgRepository {
     ) -> RepositoryResult<ReplyDraft> {
         let now = OffsetDateTime::now_utc();
         let res = sqlx::query(
-            r#"
+            r"
             update reply_drafts
             set state = 'rejected',
                 reviewed_by = $1,
                 reviewed_at = $2,
                 rejection_reason = $3
             where id = $4 and state in ('pending_review','edited','approved')
-            "#,
+            ",
         )
         .bind(_reviewed_by)
         .bind(now)
@@ -515,13 +515,13 @@ impl Repository for PgRepository {
         posted_at: OffsetDateTime,
     ) -> RepositoryResult<ReplyDraft> {
         let res = sqlx::query(
-            r#"
+            r"
             update reply_drafts
             set state = 'posted',
                 posted_at = $1,
                 platform_post_error = null
             where id = $2 and state = 'approved'
-            "#,
+            ",
         )
         .bind(posted_at)
         .bind(draft_id)
@@ -545,12 +545,12 @@ impl Repository for PgRepository {
         error: String,
     ) -> RepositoryResult<ReplyDraft> {
         let res = sqlx::query(
-            r#"
+            r"
             update reply_drafts
             set state = 'failed',
                 platform_post_error = $1
             where id = $2 and state = 'approved'
-            "#,
+            ",
         )
         .bind(error)
         .bind(draft_id)

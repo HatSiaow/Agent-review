@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
             let repo = storage::PgRepository::connect(&cfg).await.context("connect db")?;
             match command {
                 MigrateCommand::Up => {
-                    repo.migrate().await.context("migrate")?;
+                    repo.migrate().context("migrate")?;
                     tracing::info!("migrations complete");
                 }
                 MigrateCommand::Status => {
