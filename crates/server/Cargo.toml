@@ -15,10 +15,13 @@ adapter-google = { path = "../adapters/google" }
 adapter-ubereats = { path = "../adapters/ubereats" }
 axum.workspace = true
 common = { path = "../common" }
+domain = { path = "../domain" }
 llm-client = { path = "../llm_client" }
 notifier = { path = "../notifier" }
 poster = { path = "../poster" }
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tokio-util = "0.7"
+uuid.workspace = true
 

@@ -2,8 +2,6 @@
 //!
 //! Provides a trait for LLM inference and an in-memory fake for testing.
 
-use std::future::Future;
-
 use domain::Platform;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -55,11 +53,9 @@ pub struct GenerateResponse {
 }
 
 /// Trait abstracting LLM inference.
+#[async_trait::async_trait]
 pub trait LlmClient: Send + Sync {
-    fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> impl Future<Output = Result<GenerateResponse, LlmError>> + Send;
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, LlmError>;
 }
 
 /// In-memory fake that returns scripted responses for testing.

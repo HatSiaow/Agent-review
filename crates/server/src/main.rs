@@ -1,5 +1,7 @@
 use anyhow::Context as _;
 use tokio_util::sync::CancellationToken;
+use adapter_google::GoogleReviewClient as _;
+use adapter_ubereats::UberEatsReviewClient as _;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,34 +61,28 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
             _ = google_tick.tick() => {
                 let cfg = google_cfg.clone();
                 let store2 = store.clone();
-                let _ = tokio::task::spawn_blocking(move || adapter_google::HttpGoogleClient::new().list_reviews(&cfg))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|raws| async move {
-                        for raw in raws {
-                            if let Ok(review) = adapter_google::normalize_google_review(&raw) {
-                                store2.ingest_review(review).await;
-                            }
+                if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
+                    adapter_google::HttpGoogleClient::new().list_reviews(&cfg)
+                }).await {
+                    for raw in raws {
+                        if let Ok(review) = adapter_google::normalize_google_review(&raw) {
+                            store2.ingest_review(review).await;
                         }
-                    })
-                    .map(|f| tokio::spawn(f));
+                    }
+                }
             }
             _ = ubereats_tick.tick() => {
                 let cfg = ubereats_cfg.clone();
                 let store2 = store.clone();
-                let _ = tokio::task::spawn_blocking(move || adapter_ubereats::HttpUberEatsClient::new().list_reviews(&cfg))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|raws| async move {
-                        for raw in raws {
-                            if let Ok(review) = adapter_ubereats::normalize_ubereats_review(&raw) {
-                                store2.ingest_review(review).await;
-                            }
+                if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
+                    adapter_ubereats::HttpUberEatsClient::new().list_reviews(&cfg)
+                }).await {
+                    for raw in raws {
+                        if let Ok(review) = adapter_ubereats::normalize_ubereats_review(&raw) {
+                            store2.ingest_review(review).await;
                         }
-                    })
-                    .map(|f| tokio::spawn(f));
+                    }
+                }
             }
         }
     }

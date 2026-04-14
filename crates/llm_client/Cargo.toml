@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 domain = { path = "../domain" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
