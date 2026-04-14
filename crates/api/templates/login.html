@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Log in</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background:#0f1419; color:#e8eef5; max-width:420px; margin:3rem auto; padding:1rem; }
+    label { display:block; margin-top:1rem; color:#8b9bb4; }
+    input { width:100%; padding:0.5rem; margin-top:0.25rem; border-radius:6px; border:1px solid #334155; background:#0b1018; color:#e8eef5; }
+    button { margin-top:1.25rem; padding:0.5rem 1rem; background:#3b82f6; color:white; border:none; border-radius:6px; cursor:pointer; width:100%; }
+    .err { color:#f87171; margin-top:1rem; }
+  </style>
+</head>
+<body>
+  <h1>Log in</h1>
+  {% if !error.is_empty() %}
+  <p class="err">{{ error }}</p>
+  {% endif %}
+  <form method="post" action="/login">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}"/>
+    <label>Email<input type="email" name="email" required autocomplete="username"/></label>
+    <label>Password<input type="password" name="password" required autocomplete="current-password"/></label>
+    <button type="submit">Sign in</button>
+  </form>
+  <p style="color:#8b9bb4;font-size:0.9rem;margin-top:2rem;">Dev (in-memory): owner@example.com / password</p>
+</body>
+</html>

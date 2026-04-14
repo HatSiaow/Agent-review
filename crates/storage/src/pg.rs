@@ -1,10 +1,18 @@
-use domain::{DraftState, ReplyDraft, Review};
+use std::collections::HashMap;
+
+use domain::{DraftState, ReplyDraft, RestaurantSettings, Review};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
 
-use crate::repo::{NotificationOutboxItem, Repository, RepositoryError, RepositoryResult};
+use crate::repo::{
+    DraftListQuery, NotificationOutboxItem, Repository, RepositoryError, RepositoryResult,
+    ReviewListQuery,
+};
+
+/// Singleton row id for `restaurant_settings` (see migration `0005_restaurant_settings.sql`).
+const RESTAURANT_SETTINGS_ID: Uuid = uuid::Uuid::from_u128(1);
 
 #[derive(Debug, Clone)]
 pub struct PgRepositoryConfig {
@@ -346,6 +354,14 @@ impl Repository for PgRepository {
         Ok(out)
     }
 
+    async fn list_reviews_filtered(
+        &self,
+        query: ReviewListQuery,
+    ) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
+        let rows = self.list_reviews().await?;
+        Ok(crate::list_filters::filter_sort_reviews(rows, &query))
+    }
+
     async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)> {
         let r: Option<ReviewRow> = sqlx::query_as("select * from reviews where id = $1")
             .bind(id)
@@ -651,6 +667,17 @@ impl Repository for PgRepository {
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
         rows.into_iter().map(draft_from_row).collect()
+    }
+
+    async fn list_drafts_filtered(&self, query: DraftListQuery) -> RepositoryResult<Vec<ReplyDraft>> {
+        let drafts = self.list_drafts().await?;
+        let reviews = self.list_reviews().await?;
+        let map: HashMap<Uuid, Review> = reviews.into_iter().map(|(r, _)| (r.id, r)).collect();
+        let pairs: Vec<(ReplyDraft, Review)> = drafts
+            .into_iter()
+            .filter_map(|d| map.get(&d.review_id).cloned().map(|r| (d, r)))
+            .collect();
+        Ok(crate::list_filters::filter_sort_drafts(pairs, &query))
     }
 
     async fn store_agent_draft(&self, _draft: ReplyDraft) -> RepositoryResult<()> {
@@ -1221,6 +1248,82 @@ impl Repository for PgRepository {
             role,
             created_at: row.created_at,
         }))
+    }
+
+    async fn list_users(&self) -> RepositoryResult<Vec<domain::User>> {
+        #[derive(Debug, Clone, sqlx::FromRow)]
+        struct UserRow {
+            id: Uuid,
+            email: String,
+            role: String,
+            created_at: OffsetDateTime,
+        }
+
+        let rows: Vec<UserRow> = sqlx::query_as(
+            r"
+            select id, email, role, created_at
+            from users
+            order by email asc
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let role = match row.role.as_str() {
+                    "owner" => domain::UserRole::Owner,
+                    "manager" => domain::UserRole::Manager,
+                    "viewer" => domain::UserRole::Viewer,
+                    _ => return Err(RepositoryError::Storage("invalid user role".into())),
+                };
+                Ok(domain::User {
+                    id: row.id,
+                    email: row.email,
+                    role,
+                    created_at: row.created_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_restaurant_settings(&self) -> RepositoryResult<RestaurantSettings> {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            r"
+            select payload_json
+            from restaurant_settings
+            where id = $1
+            ",
+        )
+        .bind(RESTAURANT_SETTINGS_ID)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        let Some((payload,)) = row else {
+            return Ok(RestaurantSettings::default());
+        };
+        Ok(domain::RestaurantSettings::from_json_partial(&payload))
+    }
+
+    async fn put_restaurant_settings(&self, settings: RestaurantSettings) -> RepositoryResult<()> {
+        let payload = serde_json::to_value(&settings).map_err(|e| {
+            RepositoryError::Storage(format!("serialize restaurant settings: {e}"))
+        })?;
+        sqlx::query(
+            r"
+            update restaurant_settings
+            set payload_json = $1, updated_at = now()
+            where id = $2
+            ",
+        )
+        .bind(payload)
+        .bind(RESTAURANT_SETTINGS_ID)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     async fn create_session(&self, session: domain::Session) -> RepositoryResult<()> {

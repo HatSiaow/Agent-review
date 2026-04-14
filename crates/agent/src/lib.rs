@@ -174,9 +174,40 @@ pub struct AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
+        Self::from_restaurant_settings(&domain::RestaurantSettings::default())
+    }
+}
+
+/// Build agent configuration from persisted [`domain::RestaurantSettings`].
+///
+/// This keeps the LLM prompt aligned with the single source of truth in storage (no duplicate
+/// hard-coded demo strings in the server binary).
+#[must_use]
+pub fn agent_config_from_settings(s: &domain::RestaurantSettings) -> AgentConfig {
+    AgentConfig::from_restaurant_settings(s)
+}
+
+impl AgentConfig {
+    fn from_restaurant_settings(s: &domain::RestaurantSettings) -> Self {
+        let mut ctx = String::new();
+        ctx.push_str(&format!("Cuisine: {}\n\n", s.cuisine_style));
+        ctx.push_str(&s.context_line);
+        if let Some(ref tone) = s.voice_tone {
+            ctx.push_str("\n\n");
+            ctx.push_str("Voice/tone: ");
+            ctx.push_str(tone);
+        }
+        if !s.signature_dishes.is_empty() {
+            ctx.push_str("\n\nSignature dishes: ");
+            ctx.push_str(&s.signature_dishes.join(", "));
+        }
+        if let Some(ref hours) = s.opening_hours_text {
+            ctx.push_str("\n\nHours: ");
+            ctx.push_str(hours);
+        }
         Self {
-            restaurant_name: "Chez Luca".into(),
-            restaurant_context: "A small family-run Italian trattoria in the neighbourhood.".into(),
+            restaurant_name: s.restaurant_name.clone(),
+            restaurant_context: ctx,
         }
     }
 }

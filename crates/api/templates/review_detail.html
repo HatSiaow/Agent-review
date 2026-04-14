@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Review — Neighbourhood Restaurant Review Agent</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background:#0f1419; color:#e8eef5; max-width:800px; margin:2rem auto; padding:1rem; }
+    a { color:#3b82f6; }
+    .card { background:#1a2332; border-radius:8px; padding:1rem; margin:1rem 0; border:1px solid #243044; }
+    .badge { display:inline-block; padding:0.15rem 0.45rem; border-radius:4px; font-size:0.8rem; background:#243044; }
+  </style>
+</head>
+<body>
+  <p><a href="/">← Queue</a></p>
+  <h1>Review</h1>
+  <div class="card">
+    <p><span class="badge">{{ platform }}</span> <strong>{{ author }}</strong> · {{ rating }}★ · {{ status }}</p>
+    <p>{{ body }}</p>
+  </div>
+  {% if draft_state != "" %}
+  <div class="card">
+    <h2>Draft</h2>
+    <p style="color:#8b9bb4;">{{ draft_state }}</p>
+    <p>{{ draft_text }}</p>
+  </div>
+  {% endif %}
+</body>
+</html>

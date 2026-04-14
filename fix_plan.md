@@ -23,7 +23,11 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Add missing transitions/guards in `domain` FSMs and enforce server-side (not just UI).
     - Code: `crates/domain/src/{fsm.rs,review_fsm.rs,audit.rs}`, `crates/api/src/v1.rs`, `crates/poster/src/lib.rs`, `crates/server/src/main.rs`.
   - **Fix Problem Details to be RFC 9457-aligned** (content-type `application/problem+json`, proper `instance`, consistent mapping of validation errors) per `specs/coder/11-api-design.md`.
-    - Code: `crates/api/src/problem.rs`, `crates/api/src/v1.rs`.
+    - Resolved (v0.1):
+      - `ProblemDetails` includes `detail` and `invalid_params`; `ApiError::Validation` maps to structured invalid parameters.
+      - `instance` is populated from the request path via task-local `request_ctx::REQUEST_PATH` middleware.
+    - Remaining: ensure every validation path uses `Validation` consistently (audit call sites); optional extension fields if spec adds them.
+    - Code: `crates/api/src/problem.rs`, `crates/api/src/request_ctx.rs`, `crates/api/src/lib.rs`, `crates/api/src/v1.rs`.
 - **P0 — Data/storage correctness (otherwise the inbox will lose/duplicate work)**
   - **Make storage schema + repo behavior match the specs** (`model_version`, defaults, indexes, constraints, proper tables) per `specs/coder/08-data-storage.md` and `specs/coder/04-unified-review-data-model.md`.
     - Biggest mismatches: `agent_runs`, `notifications_outbox`, `reviews_sync_state`, `users` columns/constraints, missing defaults/indexes.
@@ -32,11 +36,13 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: new worker/binary path (likely `crates/server` role + `crates/storage` SQL helpers).
 - **P0 — Web UI (the “single inbox” is not usable without it)**
   - **Implement server-rendered UI (Askama + htmx) routes and templates** per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md`.
-    - Missing entirely: no `web_ui` crate, no templates, no HTML routes (`GET /`, `GET /reviews/{id}`, `GET /settings`, `GET /users`, auth pages).
-    - Likely code: add `crates/web_ui` (per `specs/coder/10-rust-tech-stack.md`) or implement inside `crates/api`, plus templates.
+    - Implemented (v0.1) inside `crates/api` (no separate `web_ui` crate): Askama templates + routes for login, queue (`/`), review detail, settings, users; shared cookie helpers in `auth_cookies`.
+    - Remaining vs spec: richer htmx interactions (inline approve/edit without full page flows), accessibility polish, and full card/action parity with JSON API.
+    - Code: `crates/api/src/web_ui.rs`, `crates/api/templates/*.html`, `crates/api/src/auth_cookies.rs`, `crates/api/build.rs`, `crates/api/askama.toml`.
   - **Queue semantics in UI** (Needs You Now / Ready To Send / History tabs, filters, sorting, card constraints) per `specs/coder/06-human-in-the-loop-workflow.md` and `specs/coder/16-frontend-web-ui.md`.
-    - Current: JSON list endpoints exist but do not implement filters/sorting/tab semantics.
-    - Code: `crates/api/src/v1.rs`, storage query methods.
+    - Implemented for API + storage: `ReviewListQuery` / `DraftListQuery`, `QueueTab`, `ReviewSort`, shared `list_filters` (memory + pg), query params on `/api/v1/reviews` and `/api/v1/drafts`; web queue uses the same repo filters.
+    - Remaining: UI-specific constraints (card limits, bulk actions from queue page, full tab UX per spec).
+    - Code: `crates/storage/src/{repo.rs,list_filters.rs,pg.rs,memory.rs}`, `crates/api/src/v1.rs`, `crates/api/src/web_ui.rs`.
 - **P1 — Reliable workflow orchestration (ingestion → agent → approve → poster)**
   - **Replace demo “scan loops” with durable job/outbox processing** per `specs/coder/01-architecture.md`, `specs/coder/07-notification-system.md`, `specs/coder/13-deployment-infra.md` and the new `specs/coder/17-work-queues-and-outbox-processing.md`.
     - Current `crates/server/src/main.rs` polls `list_reviews/list_drafts` every 2s and uses in-memory de-dupe; no durable queues/outbox claims.
@@ -87,8 +93,9 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Guardrail rule alignment** (refund promise allowlist/policy patterns, supported language config, restaurant-name self-reference alternative) per `specs/coder/05-ai-response-agent.md`.
     - Code: `crates/domain/src/guardrails.rs`.
   - **Replace hard-coded “Chez Luca” defaults with persisted restaurant settings** (name, cuisine, hours, signature dishes, voice) per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md` (`/api/v1/settings`).
-    - Current: agent config and prompts embed demo defaults; no settings endpoints/storage exist.
-    - Code: `crates/agent/src/lib.rs`, `crates/llm_client/src/lib.rs`, `crates/api/src/v1.rs`, `crates/storage` (new table), UI templates.
+    - Resolved (v0.1): `domain::RestaurantSettings` + migration `0005_restaurant_settings.sql`; repo `get/put_restaurant_settings`; JSON `GET/PUT /api/v1/settings`; web settings form; `agent_worker` loads settings and builds `AgentConfig` via `agent_config_from_settings`.
+    - Remaining: validate patch fields against spec limits; optional versioning of settings for audit.
+    - Code: `crates/domain/src/settings.rs`, `crates/storage/migrations/0005_restaurant_settings.sql`, `crates/storage/src/{repo.rs,pg.rs,memory.rs}`, `crates/agent/src/lib.rs`, `crates/server/src/main.rs`, `crates/api/src/{v1.rs,web_ui.rs,store.rs}`.
 - **P2 — Spec-complete platform behaviors**
   - **Google adapter watermark + stop paging** + configurable host/path, jittered backoff up to 5 minutes, drift detection/withdrawn handling per `specs/coder/02-google-reviews-integration.md`.
     - Code: `crates/adapters/google/src/lib.rs`, `crates/adapters/google/src/normalize.rs`.
@@ -116,6 +123,16 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Current: `google-auth` and `migrate status` are placeholders.
     - Code: `crates/cli/src/main.rs`.
 - **Completed (this session)**
+  - **RFC 9457 Problem Details + request path for `instance`**: extended problem JSON shape; task-local request path capture.
+    - Code: `crates/api/src/problem.rs`, `crates/api/src/request_ctx.rs`, `crates/api/src/lib.rs`
+  - **Restaurant settings persistence + agent integration**: singleton `restaurant_settings` table; domain merge/patch; API and web UI; agent uses dynamic profile instead of hard-coded demo defaults.
+    - Code: `crates/domain/src/settings.rs`, `crates/storage/migrations/0005_restaurant_settings.sql`, `crates/storage/src/{repo.rs,pg.rs,memory.rs}`, `crates/agent/src/lib.rs`, `crates/server/src/main.rs`, `crates/api/src/{v1.rs,web_ui.rs,store.rs}`
+  - **Review/draft list filters + sorting (shared memory/pg)**: `list_filters` module; `list_reviews_filtered` / `list_drafts_filtered`; JSON query params.
+    - Code: `crates/storage/src/list_filters.rs`, `crates/storage/src/{repo.rs,pg.rs,memory.rs}`, `crates/api/src/v1.rs`
+  - **Minimal Askama web UI + auth cookie helpers**: HTML routes and templates; centralized session/CSRF cookie signing helpers.
+    - Code: `crates/api/src/web_ui.rs`, `crates/api/src/auth_cookies.rs`, `crates/api/templates/`, `crates/api/Cargo.toml`, `crates/api/build.rs`
+  - **`ReplyDraft::is_active` includes `ApprovedPendingUndo`**: keeps bulk-approved drafts visible during undo window.
+    - Code: `crates/domain/src/model.rs`
   - **Storage upsert semantics for reviews (pg + memory)**: switched to “update on conflict” semantics (no more `DO NOTHING`); refreshes stored review data when a duplicate `(platform, source_review_id)` arrives.
     - Code: `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
   - **Google polling stop-at-watermark persisted via `reviews_sync_state`**: persist/read watermark so polling stops correctly and resumes without re-scanning.

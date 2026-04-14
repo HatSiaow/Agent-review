@@ -9,7 +9,10 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::repo::{NotificationOutboxItem, Repository, RepositoryError, RepositoryResult};
+use crate::repo::{
+    DraftListQuery, NotificationOutboxItem, Repository, RepositoryError, RepositoryResult,
+    ReviewListQuery,
+};
 
 #[derive(Debug, Clone)]
 pub struct InMemoryRepository(Arc<Mutex<State>>);
@@ -30,6 +33,7 @@ struct State {
     sessions: HashMap<Uuid, domain::Session>,
     notification_outbox: HashMap<Uuid, NotificationOutboxItem>,
     notification_outbox_sent_at: HashMap<Uuid, OffsetDateTime>,
+    restaurant_settings: domain::RestaurantSettings,
 }
 
 impl InMemoryRepository {
@@ -77,6 +81,7 @@ impl Default for InMemoryRepository {
         state
             .users_auth
             .insert(seed_user_id, (password_hash, None));
+        state.restaurant_settings = domain::RestaurantSettings::default();
 
         Self(Arc::new(Mutex::new(state)))
     }
@@ -90,7 +95,7 @@ impl Repository for InMemoryRepository {
 
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
         let state = self.0.lock().await;
-        Ok(state
+        let mut rows: Vec<(Review, Option<ReplyDraft>)> = state
             .reviews
             .values()
             .cloned()
@@ -102,7 +107,17 @@ impl Repository for InMemoryRepository {
                     .cloned();
                 (r, active)
             })
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| b.0.updated_at.cmp(&a.0.updated_at));
+        Ok(rows)
+    }
+
+    async fn list_reviews_filtered(
+        &self,
+        query: ReviewListQuery,
+    ) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
+        let rows = self.list_reviews().await?;
+        Ok(crate::list_filters::filter_sort_reviews(rows, &query))
     }
 
     async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)> {
@@ -320,7 +335,20 @@ impl Repository for InMemoryRepository {
 
     async fn list_drafts(&self) -> RepositoryResult<Vec<ReplyDraft>> {
         let state = self.0.lock().await;
-        Ok(state.drafts.values().cloned().collect())
+        let mut out: Vec<ReplyDraft> = state.drafts.values().cloned().collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    async fn list_drafts_filtered(&self, query: DraftListQuery) -> RepositoryResult<Vec<ReplyDraft>> {
+        let drafts = self.list_drafts().await?;
+        let state = self.0.lock().await;
+        let pairs: Vec<(ReplyDraft, Review)> = drafts
+            .into_iter()
+            .filter_map(|d| state.reviews.get(&d.review_id).cloned().map(|r| (d, r)))
+            .collect();
+        drop(state);
+        Ok(crate::list_filters::filter_sort_drafts(pairs, &query))
     }
 
     async fn store_agent_draft(&self, draft: ReplyDraft) -> RepositoryResult<()> {
@@ -636,6 +664,24 @@ impl Repository for InMemoryRepository {
     async fn get_user_by_id(&self, user_id: Uuid) -> RepositoryResult<Option<domain::User>> {
         let state = self.0.lock().await;
         Ok(state.users.get(&user_id).cloned())
+    }
+
+    async fn list_users(&self) -> RepositoryResult<Vec<domain::User>> {
+        let state = self.0.lock().await;
+        let mut out: Vec<domain::User> = state.users.values().cloned().collect();
+        out.sort_by(|a, b| a.email.cmp(&b.email));
+        Ok(out)
+    }
+
+    async fn get_restaurant_settings(&self) -> RepositoryResult<domain::RestaurantSettings> {
+        let state = self.0.lock().await;
+        Ok(state.restaurant_settings.clone())
+    }
+
+    async fn put_restaurant_settings(&self, settings: domain::RestaurantSettings) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        state.restaurant_settings = settings;
+        Ok(())
     }
 
     async fn create_session(&self, session: domain::Session) -> RepositoryResult<()> {

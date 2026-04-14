@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::{fmt, fmt::Formatter};
 
-use domain::{ReplyDraft, Review};
+use domain::{ReplyDraft, RestaurantSettings, RestaurantSettingsPatch, Review};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -64,6 +64,50 @@ impl Store {
 
     pub async fn list_reviews(&self) -> Vec<(Review, Option<ReplyDraft>)> {
         self.repo.list_reviews().await.unwrap_or_default()
+    }
+
+    pub async fn list_reviews_filtered(
+        &self,
+        query: storage::ReviewListQuery,
+    ) -> Vec<(Review, Option<ReplyDraft>)> {
+        self.repo
+            .list_reviews_filtered(query)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn list_drafts_filtered(&self, query: storage::DraftListQuery) -> Vec<ReplyDraft> {
+        self.repo
+            .list_drafts_filtered(query)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn get_restaurant_settings(&self) -> Result<RestaurantSettings, ApiError> {
+        self.repo
+            .get_restaurant_settings()
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn update_restaurant_settings(
+        &self,
+        patch: RestaurantSettingsPatch,
+    ) -> Result<RestaurantSettings, ApiError> {
+        let current = self.get_restaurant_settings().await?;
+        let merged = current.merge(patch);
+        self.repo
+            .put_restaurant_settings(merged.clone())
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)?;
+        Ok(merged)
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<domain::User>, ApiError> {
+        self.repo
+            .list_users()
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
     }
 
     pub async fn ping(&self) -> Result<(), ApiError> {

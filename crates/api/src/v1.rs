@@ -1,15 +1,15 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use domain::ReplyDraft;
 use http::HeaderMap;
-use http::header;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::ActingUser;
-use crate::problem::ApiError;
+use crate::auth_cookies::{login_set_cookie_headers, logout_clear_cookie_headers, sign_session_cookie};
+use crate::problem::{ApiError, InvalidParam};
 use crate::Store;
 
 fn prometheus_handle() -> &'static metrics_exporter_prometheus::PrometheusHandle {
@@ -29,11 +29,13 @@ pub fn router() -> Router<Store> {
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/reviews", get(list_reviews))
+        .route("/drafts", get(list_drafts))
+        .route("/settings", get(get_settings).put(put_settings))
+        .route("/users", get(list_users_api))
         .route("/reviews/:id", get(get_review))
         .route("/reviews/:id/skip", post(skip_review))
         .route("/reviews/:id/unskip", post(unskip_review))
         .route("/reviews/:id/regenerate", post(regenerate_review))
-        .route("/drafts", get(list_drafts))
         .route("/drafts/:id/approve", post(approve_draft))
         .route("/drafts/:id/reject", post(reject_draft))
         .route("/drafts/bulk-approve", post(bulk_approve))
@@ -68,19 +70,6 @@ fn require_csrf(headers: &HeaderMap) -> Result<(), ApiError> {
         return Err(ApiError::Forbidden);
     }
     Ok(())
-}
-
-fn sign_session_cookie(session_id: Uuid) -> Result<String, ApiError> {
-    use hmac::Mac as _;
-    let secret = std::env::var("APP_SESSION_SECRET").map_err(|_| ApiError::ServiceUnavailable)?;
-    if secret.trim().len() < 32 {
-        return Err(ApiError::ServiceUnavailable);
-    }
-    let mut mac =
-        hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::ServiceUnavailable)?;
-    mac.update(session_id.as_bytes());
-    let sig = mac.finalize().into_bytes();
-    Ok(format!("{session_id}.{}", hex::encode(sig)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,22 +111,7 @@ async fn login(
 
     let csrf_token = Uuid::new_v4().to_string();
     let session_value = sign_session_cookie(session.id)?;
-
-    let mut headers = HeaderMap::new();
-    headers.append(
-        header::SET_COOKIE,
-        format!(
-            "session={session_value}; Path=/; HttpOnly; SameSite=Lax"
-        )
-        .parse()
-        .map_err(|_| ApiError::ServiceUnavailable)?,
-    );
-    headers.append(
-        header::SET_COOKIE,
-        format!("csrf_token={csrf_token}; Path=/; SameSite=Lax")
-            .parse()
-            .map_err(|_| ApiError::ServiceUnavailable)?,
-    );
+    let headers = login_set_cookie_headers(&session_value, &csrf_token)?;
 
     Ok((headers, Json(LoginResponse { user: auth.user })))
 }
@@ -166,14 +140,7 @@ async fn logout(
     // Also emit an audit event in the future; for now logout is a session revoke only.
     let _ = user; // keep extractor for auth enforcement
 
-    let mut out = HeaderMap::new();
-    out.append(
-        header::SET_COOKIE,
-        "session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
-            .parse()
-            .map_err(|_| ApiError::ServiceUnavailable)?,
-    );
-    Ok(out)
+    logout_clear_cookie_headers()
 }
 
 async fn maybe_idempotent_success<T: serde::de::DeserializeOwned>(
@@ -247,8 +214,139 @@ pub struct ReviewListItem {
     pub active_draft: Option<domain::ReplyDraft>,
 }
 
-async fn list_reviews(State(store): State<Store>, _user: ActingUser) -> Json<Vec<ReviewListItem>> {
-    let reviews = store.list_reviews().await;
+#[derive(Debug, Deserialize)]
+pub struct ReviewsQuery {
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub rating: Option<u8>,
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub queue: Option<String>,
+    #[serde(default)]
+    pub sort: Option<String>,
+}
+
+fn parse_platform(s: &str) -> Result<domain::Platform, ApiError> {
+    match s {
+        "google" => Ok(domain::Platform::Google),
+        "ubereats" => Ok(domain::Platform::Ubereats),
+        _ => Err(ApiError::Validation {
+            title: "Invalid query parameter",
+            detail: "platform must be google or ubereats".into(),
+            invalid_params: vec![InvalidParam {
+                name: "platform".into(),
+                reason: "unknown platform".into(),
+            }],
+        }),
+    }
+}
+
+fn parse_review_status(s: &str) -> Result<domain::ReviewStatus, ApiError> {
+    match s {
+        "new" => Ok(domain::ReviewStatus::New),
+        "drafting" => Ok(domain::ReviewStatus::Drafting),
+        "awaiting_human" => Ok(domain::ReviewStatus::AwaitingHuman),
+        "replied" => Ok(domain::ReviewStatus::Replied),
+        "withdrawn" => Ok(domain::ReviewStatus::Withdrawn),
+        "skipped" => Ok(domain::ReviewStatus::Skipped),
+        _ => Err(ApiError::Validation {
+            title: "Invalid query parameter",
+            detail: "unknown review status".into(),
+            invalid_params: vec![InvalidParam {
+                name: "status".into(),
+                reason: "unknown status".into(),
+            }],
+        }),
+    }
+}
+
+fn parse_queue_tab(s: &str) -> Result<storage::QueueTab, ApiError> {
+    match s {
+        "needs" | "needs_you_now" => Ok(storage::QueueTab::NeedsYouNow),
+        "ready" | "ready_to_send" => Ok(storage::QueueTab::ReadyToSend),
+        "history" => Ok(storage::QueueTab::History),
+        _ => Err(ApiError::Validation {
+            title: "Invalid query parameter",
+            detail: "queue must be needs, ready, or history".into(),
+            invalid_params: vec![InvalidParam {
+                name: "queue".into(),
+                reason: "unknown queue tab".into(),
+            }],
+        }),
+    }
+}
+
+fn parse_review_sort(s: &str) -> Result<storage::ReviewSort, ApiError> {
+    match s {
+        "updated_at_desc" => Ok(storage::ReviewSort::UpdatedAtDesc),
+        "updated_at_asc" => Ok(storage::ReviewSort::UpdatedAtAsc),
+        "rating_desc" => Ok(storage::ReviewSort::RatingDesc),
+        "created_at_desc" => Ok(storage::ReviewSort::CreatedAtDesc),
+        _ => Err(ApiError::Validation {
+            title: "Invalid query parameter",
+            detail: "unknown sort".into(),
+            invalid_params: vec![InvalidParam {
+                name: "sort".into(),
+                reason: "unknown sort key".into(),
+            }],
+        }),
+    }
+}
+
+async fn list_reviews(
+    State(store): State<Store>,
+    _user: ActingUser,
+    Query(q): Query<ReviewsQuery>,
+) -> Result<Json<Vec<ReviewListItem>>, ApiError> {
+    let platform = match q.platform.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_platform(s)?),
+    };
+    let status = match q.status.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_review_status(s)?),
+    };
+    if let Some(r) = q.rating {
+        if !(1..=5).contains(&r) {
+            return Err(ApiError::Validation {
+                title: "Invalid query parameter",
+                detail: "rating must be 1–5".into(),
+                invalid_params: vec![InvalidParam {
+                    name: "rating".into(),
+                    reason: "out of range".into(),
+                }],
+            });
+        }
+    }
+    let queue = match q.queue.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_queue_tab(s)?),
+    };
+    let sort = match q.sort.as_deref() {
+        None | Some("") => storage::ReviewSort::UpdatedAtDesc,
+        Some(s) => parse_review_sort(s)?,
+    };
+
+    let search = q
+        .q
+        .as_ref()
+        .map(|s: &String| s.trim().to_string())
+        .filter(|s: &String| !s.is_empty());
+
+    let list_q = storage::ReviewListQuery {
+        platform,
+        status,
+        rating: q.rating,
+        q: search,
+        queue,
+        sort,
+    };
+
+    let reviews = store.list_reviews_filtered(list_q).await;
     let out = reviews
         .into_iter()
         .map(|(review, active_draft)| ReviewListItem {
@@ -256,7 +354,7 @@ async fn list_reviews(State(store): State<Store>, _user: ActingUser) -> Json<Vec
             active_draft,
         })
         .collect();
-    Json(out)
+    Ok(Json(out))
 }
 
 #[derive(Debug, Serialize)]
@@ -335,8 +433,120 @@ async fn regenerate_review(
 
 // --- Drafts ---
 
-async fn list_drafts(State(store): State<Store>, _user: ActingUser) -> Json<Vec<ReplyDraft>> {
-    Json(store.list_drafts().await)
+#[derive(Debug, Deserialize)]
+pub struct DraftsQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub rating: Option<u8>,
+    #[serde(default)]
+    pub flag: Option<String>,
+}
+
+fn parse_draft_state(s: &str) -> Result<domain::DraftState, ApiError> {
+    use domain::DraftState;
+    match s {
+        "pending_review" => Ok(DraftState::PendingReview),
+        "approved" => Ok(DraftState::Approved),
+        "approved_pending_undo" => Ok(DraftState::ApprovedPendingUndo),
+        "edited" => Ok(DraftState::Edited),
+        "rejected" => Ok(DraftState::Rejected),
+        "posted" => Ok(DraftState::Posted),
+        "failed" => Ok(DraftState::Failed),
+        _ => Err(ApiError::Validation {
+            title: "Invalid query parameter",
+            detail: "unknown draft state".into(),
+            invalid_params: vec![InvalidParam {
+                name: "state".into(),
+                reason: "unknown state".into(),
+            }],
+        }),
+    }
+}
+
+async fn list_drafts(
+    State(store): State<Store>,
+    _user: ActingUser,
+    Query(q): Query<DraftsQuery>,
+) -> Result<Json<Vec<ReplyDraft>>, ApiError> {
+    let state = match q.state.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_draft_state(s)?),
+    };
+    if let Some(r) = q.rating {
+        if !(1..=5).contains(&r) {
+            return Err(ApiError::Validation {
+                title: "Invalid query parameter",
+                detail: "rating must be 1–5".into(),
+                invalid_params: vec![InvalidParam {
+                    name: "rating".into(),
+                    reason: "out of range".into(),
+                }],
+            });
+        }
+    }
+    let flag_warnings = match q.flag.as_deref() {
+        None | Some("") => None,
+        Some("warnings") => Some(true),
+        Some("none") => Some(false),
+        Some(_) => {
+            return Err(ApiError::Validation {
+                title: "Invalid query parameter",
+                detail: "flag must be warnings or none".into(),
+                invalid_params: vec![InvalidParam {
+                    name: "flag".into(),
+                    reason: "unknown flag".into(),
+                }],
+            });
+        }
+    };
+
+    let list_q = storage::DraftListQuery {
+        state,
+        rating: q.rating,
+        flag_warnings,
+    };
+    Ok(Json(store.list_drafts_filtered(list_q).await))
+}
+
+// --- Settings / users ---
+
+async fn get_settings(
+    State(store): State<Store>,
+    user: ActingUser,
+) -> Result<Json<domain::RestaurantSettings>, ApiError> {
+    let _ = user;
+    Ok(Json(store.get_restaurant_settings().await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SettingsPutBody {
+    #[serde(flatten)]
+    pub patch: domain::RestaurantSettingsPatch,
+}
+
+async fn put_settings(
+    State(store): State<Store>,
+    user: ActingUser,
+    headers: HeaderMap,
+    Json(body): Json<SettingsPutBody>,
+) -> Result<Json<domain::RestaurantSettings>, ApiError> {
+    require_csrf(&headers)?;
+    if user.role != domain::UserRole::Owner {
+        return Err(ApiError::Forbidden);
+    }
+    let updated = store.update_restaurant_settings(body.patch).await?;
+    Ok(Json(updated))
+}
+
+async fn list_users_api(
+    State(store): State<Store>,
+    user: ActingUser,
+) -> Result<Json<Vec<domain::User>>, ApiError> {
+    if user.role != domain::UserRole::Owner {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(store.list_users().await?))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Users</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background:#0f1419; color:#e8eef5; max-width:720px; margin:2rem auto; padding:1rem; }
+    a { color:#3b82f6; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { text-align:left; padding:0.5rem; border-bottom:1px solid #243044; }
+  </style>
+</head>
+<body>
+  <p><a href="/">← Queue</a></p>
+  <h1>Users</h1>
+  <p style="color:#8b9bb4;">Owner-only list. Invite/remove flows are follow-up work.</p>
+  <table>
+    <thead><tr><th>Email</th><th>Role</th></tr></thead>
+    <tbody>
+    {% for u in users %}
+    <tr><td>{{ u.email }}</td><td>{{ u.role }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
