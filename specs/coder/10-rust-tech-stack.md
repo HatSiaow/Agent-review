@@ -30,7 +30,9 @@ Agent-review/
 │   ├── web_ui/           # Server-rendered templates (Askama) + htmx
 │   ├── cli/              # Admin CLI (migrate, google-auth, replay, etc.)
 │   └── common/           # Config loading, errors, tracing bootstrap
-└── specs/                # This directory
+└── specs/
+    ├── coder/            # Full specifications for implementation
+    └── reviewer/         # Reviewer-only specs: diff, tests, acceptance criteria
 ```
 
 Binaries live in `crates/api`, `crates/cli`, and one `server` binary that can
