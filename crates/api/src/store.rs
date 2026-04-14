@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::problem::ApiError;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Store {
     repo: Arc<dyn storage::Repository>,
 }
