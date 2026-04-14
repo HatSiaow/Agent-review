@@ -22,6 +22,7 @@ struct State {
     reviews_sync_state: HashMap<domain::Platform, time::OffsetDateTime>,
     webhook_events: HashMap<(domain::Platform, String), time::OffsetDateTime>,
     audit_events: Vec<AuditEvent>,
+    agent_runs: HashMap<Uuid, Vec<domain::AgentRun>>,
     idempotency_responses: HashMap<String, (u16, serde_json::Value, time::OffsetDateTime)>,
 }
 
@@ -34,6 +35,10 @@ impl InMemoryRepository {
 
 #[async_trait::async_trait]
 impl Repository for InMemoryRepository {
+    async fn ping(&self) -> RepositoryResult<()> {
+        Ok(())
+    }
+
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
         let state = self.0.lock().await;
         Ok(state
@@ -287,6 +292,19 @@ impl Repository for InMemoryRepository {
             serde_json::json!({ "review_id": review_id }),
         ));
         Ok(())
+    }
+
+    async fn store_agent_run(&self, run: domain::AgentRun) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        state.agent_runs.entry(run.review_id).or_default().push(run);
+        Ok(())
+    }
+
+    async fn list_agent_runs(&self, review_id: Uuid) -> RepositoryResult<Vec<domain::AgentRun>> {
+        let state = self.0.lock().await;
+        let mut out = state.agent_runs.get(&review_id).cloned().unwrap_or_default();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
     }
 
     async fn approve_draft(

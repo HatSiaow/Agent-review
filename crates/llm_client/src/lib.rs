@@ -3,6 +3,7 @@
 //! Provides a trait for LLM inference and an in-memory fake for testing.
 
 use domain::Platform;
+use sha2::Digest as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 #[derive(Debug, Error)]
@@ -47,6 +48,10 @@ pub struct GenerateRequest {
 pub struct GenerateResponse {
     pub reply_text: String,
     pub model_name: String,
+    /// sha256 hex of the exact prompt text sent to the model.
+    ///
+    /// This is stored alongside drafts/runs so responses can be reproduced and audited.
+    pub prompt_fingerprint: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub latency_ms: u64,
@@ -75,6 +80,8 @@ impl Default for InMemoryLlm {
 #[async_trait::async_trait]
 impl LlmClient for InMemoryLlm {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, LlmError> {
+        let prompt = build_prompt(&request);
+        let prompt_fingerprint = sha256_hex(prompt.as_bytes());
         let reply = if let Some(hint) = &request.hint {
             format!("{} (hint: {hint})", self.default_reply)
         } else {
@@ -87,6 +94,7 @@ impl LlmClient for InMemoryLlm {
                 ModelTier::Standard => "in-memory-standard".into(),
                 ModelTier::Escalation => "in-memory-escalation".into(),
             },
+            prompt_fingerprint,
             prompt_tokens: 100,
             completion_tokens: 50,
             latency_ms: 10,
@@ -154,6 +162,8 @@ impl AnthropicClient {
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
     model: String,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,31 +173,56 @@ struct AnthropicContent {
     text: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+fn build_prompt(request: &GenerateRequest) -> String {
+    format!(
+        "You are replying as the restaurant owner.\n\
+         Platform: {}\n\
+         Rating: {}\n\
+         Language: {}\n\
+         Restaurant: {}\n\
+         Context: {}\n\
+         Review: {}\n\
+         Hint: {}\n\
+         Write a reply under {} characters.",
+        request.platform,
+        request.review_rating,
+        request
+            .review_language
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        request.restaurant_name,
+        request.restaurant_context,
+        request
+            .review_text
+            .clone()
+            .unwrap_or_else(|| "(rating-only review)".into()),
+        request.hint.clone().unwrap_or_else(|| "(none)".into()),
+        request.max_chars
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
 #[async_trait::async_trait]
 impl LlmClient for AnthropicClient {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse, LlmError> {
         let start = std::time::Instant::now();
         let max_retries = self.config.max_retries.max(1);
 
-        let prompt = format!(
-            "You are replying as the restaurant owner.\n\
-             Platform: {}\n\
-             Rating: {}\n\
-             Language: {}\n\
-             Restaurant: {}\n\
-             Context: {}\n\
-             Review: {}\n\
-             Hint: {}\n\
-             Write a reply under {} characters.",
-            request.platform,
-            request.review_rating,
-            request.review_language.clone().unwrap_or_else(|| "unknown".into()),
-            request.restaurant_name,
-            request.restaurant_context,
-            request.review_text.clone().unwrap_or_else(|| "(rating-only review)".into()),
-            request.hint.clone().unwrap_or_else(|| "(none)".into()),
-            request.max_chars
-        );
+        let prompt = build_prompt(&request);
+        let prompt_fingerprint = sha256_hex(prompt.as_bytes());
 
         let url = format!("{}/v1/messages", self.config.api_base_url.trim_end_matches('/'));
 
@@ -248,8 +283,9 @@ impl LlmClient for AnthropicClient {
             return Ok(GenerateResponse {
                 reply_text,
                 model_name: parsed.model,
-                prompt_tokens: 0,
-                completion_tokens: 0,
+                prompt_fingerprint,
+                prompt_tokens: parsed.usage.as_ref().map_or(0, |u| u.input_tokens),
+                completion_tokens: parsed.usage.as_ref().map_or(0, |u| u.output_tokens),
                 latency_ms,
             });
         }

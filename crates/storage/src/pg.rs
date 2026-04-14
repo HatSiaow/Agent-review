@@ -112,6 +112,22 @@ struct AuditEventRow {
     details_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AgentRunRow {
+    id: Uuid,
+    review_id: Uuid,
+    draft_id: Option<Uuid>,
+    model_name: Option<String>,
+    prompt_fingerprint: Option<String>,
+    prompt_tokens: Option<i32>,
+    completion_tokens: Option<i32>,
+    latency_ms: Option<i32>,
+    tool_calls_json: serde_json::Value,
+    guardrail_verdict_json: Option<serde_json::Value>,
+    error: Option<String>,
+    created_at: OffsetDateTime,
+}
+
 fn parse_platform(s: &str) -> Result<domain::Platform, RepositoryError> {
     match s {
         "google" => Ok(domain::Platform::Google),
@@ -251,6 +267,27 @@ fn audit_from_row(row: AuditEventRow) -> Result<domain::AuditEvent, RepositoryEr
     })
 }
 
+fn agent_run_from_row(row: AgentRunRow) -> Result<domain::AgentRun, RepositoryError> {
+    Ok(domain::AgentRun {
+        id: row.id,
+        review_id: row.review_id,
+        draft_id: row.draft_id,
+        model_name: row.model_name,
+        prompt_fingerprint: row.prompt_fingerprint,
+        prompt_tokens: row
+            .prompt_tokens
+            .and_then(|v| u32::try_from(v).ok()),
+        completion_tokens: row
+            .completion_tokens
+            .and_then(|v| u32::try_from(v).ok()),
+        latency_ms: row.latency_ms.and_then(|v| u64::try_from(v).ok()),
+        tool_calls_json: row.tool_calls_json,
+        guardrail_verdict_json: row.guardrail_verdict_json,
+        error: row.error,
+        created_at: row.created_at,
+    })
+}
+
 impl PgRepository {
     async fn append_audit(&self, event: domain::AuditEvent) -> Result<(), RepositoryError> {
         sqlx::query(
@@ -278,6 +315,14 @@ impl PgRepository {
 
 #[async_trait::async_trait]
 impl Repository for PgRepository {
+    async fn ping(&self) -> RepositoryResult<()> {
+        sqlx::query_scalar::<_, i64>("select 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>> {
         let reviews: Vec<ReviewRow> =
             sqlx::query_as("select * from reviews order by updated_at desc")
@@ -670,6 +715,81 @@ impl Repository for PgRepository {
         .await?;
 
         Ok(())
+    }
+
+    async fn store_agent_run(&self, run: domain::AgentRun) -> RepositoryResult<()> {
+        let prompt_tokens: Option<i32> = run
+            .prompt_tokens
+            .and_then(|v| i32::try_from(v).ok());
+        let completion_tokens: Option<i32> = run
+            .completion_tokens
+            .and_then(|v| i32::try_from(v).ok());
+        let latency_ms: Option<i32> = run.latency_ms.and_then(|v| i32::try_from(v).ok());
+
+        sqlx::query(
+            r"
+            insert into agent_runs (
+              id, review_id, draft_id,
+              model_name, prompt_fingerprint,
+              prompt_tokens, completion_tokens, latency_ms,
+              tool_calls_json, guardrail_verdict_json,
+              error, created_at,
+              started_at, finished_at, tool_calls, status, error_text
+            ) values (
+              $1,$2,$3,
+              $4,$5,
+              $6,$7,$8,
+              $9,$10,
+              $11,$12,
+              $13,$14,$15,$16,$17,$18
+            )
+            on conflict (id) do nothing
+            ",
+        )
+        .bind(run.id)
+        .bind(run.review_id)
+        .bind(run.draft_id)
+        .bind(run.model_name)
+        .bind(run.prompt_fingerprint)
+        .bind(prompt_tokens)
+        .bind(completion_tokens)
+        .bind(latency_ms)
+        .bind(run.tool_calls_json)
+        .bind(run.guardrail_verdict_json)
+        .bind(run.error.clone())
+        .bind(run.created_at)
+        // Back-compat with the older schema columns. We keep these populated so the table
+        // remains self-consistent until we ship a full schema alignment.
+        .bind(run.created_at)
+        .bind(run.created_at)
+        .bind(0_i32)
+        .bind(if run.error.is_some() { "failed" } else { "succeeded" })
+        .bind(run.error)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_agent_runs(&self, review_id: Uuid) -> RepositoryResult<Vec<domain::AgentRun>> {
+        let rows: Vec<AgentRunRow> = sqlx::query_as(
+            r"
+            select
+              id, review_id, draft_id,
+              model_name, prompt_fingerprint,
+              prompt_tokens, completion_tokens, latency_ms,
+              tool_calls_json, guardrail_verdict_json,
+              error, created_at
+            from agent_runs
+            where review_id = $1
+            order by created_at desc
+            ",
+        )
+        .bind(review_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        rows.into_iter().map(agent_run_from_row).collect()
     }
 
     async fn approve_draft(

@@ -222,6 +222,32 @@ pub struct ReplyDraft {
     pub platform_post_error: Option<String>,
 }
 
+/// A single execution of the AI agent for a review.
+///
+/// This is the durable trace record that links:
+/// - the input review
+/// - the exact prompt fingerprint sent to the model
+/// - the resulting draft (when successful)
+/// - observability fields (tokens, latency, tool calls, guardrail verdict)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRun {
+    pub id: Uuid,
+    pub review_id: Uuid,
+    pub draft_id: Option<Uuid>,
+    pub model_name: Option<String>,
+    pub prompt_fingerprint: Option<String>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub latency_ms: Option<u64>,
+    /// JSON array of tool call records (name/args/result hashes).
+    pub tool_calls_json: serde_json::Value,
+    /// Guardrail verdict payload (serialized).
+    pub guardrail_verdict_json: Option<serde_json::Value>,
+    pub error: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
 impl ReplyDraft {
     /// Create a new draft in `PendingReview` state.
     #[must_use]

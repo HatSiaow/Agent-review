@@ -23,14 +23,7 @@ fn prometheus_handle() -> &'static metrics_exporter_prometheus::PrometheusHandle
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct AppState {
-    store: Store,
-}
-
-pub fn router(store: Store) -> Router {
-    let state = AppState { store };
-
+pub fn router() -> Router<Store> {
     Router::new()
         .route("/reviews", get(list_reviews))
         .route("/reviews/:id", get(get_review))
@@ -42,7 +35,6 @@ pub fn router(store: Store) -> Router {
         .route("/drafts/:id/reject", post(reject_draft))
         .route("/drafts/bulk-approve", post(bulk_approve))
         .route("/drafts/bulk-approve/undo", post(undo_bulk_approve))
-        .with_state(state)
 }
 
 fn require_write_role(user: ActingUser) -> Result<(), ApiError> {
@@ -123,8 +115,9 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-pub async fn readyz() -> &'static str {
-    "ok"
+pub async fn readyz(State(store): State<Store>) -> Result<&'static str, ApiError> {
+    store.ping().await?;
+    Ok("ok")
 }
 
 pub async fn metrics() -> &'static str {
@@ -145,8 +138,8 @@ pub struct ReviewListItem {
     pub active_draft: Option<domain::ReplyDraft>,
 }
 
-async fn list_reviews(State(state): State<AppState>) -> Json<Vec<ReviewListItem>> {
-    let reviews = state.store.list_reviews().await;
+async fn list_reviews(State(store): State<Store>) -> Json<Vec<ReviewListItem>> {
+    let reviews = store.list_reviews().await;
     let out = reviews
         .into_iter()
         .map(|(review, active_draft)| ReviewListItem {
@@ -164,10 +157,10 @@ pub struct ReviewWithDraft {
 }
 
 async fn get_review(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ReviewWithDraft>, ApiError> {
-    let (review, active_draft) = state.store.get_review(id).await?;
+    let (review, active_draft) = store.get_review(id).await?;
     Ok(Json(ReviewWithDraft {
         review,
         active_draft,
@@ -175,26 +168,26 @@ async fn get_review(
 }
 
 async fn skip_review(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     Path(id): Path<Uuid>,
     user: ActingUser,
     headers: HeaderMap,
 ) -> Result<Json<domain::Review>, ApiError> {
     require_write_role(user)?;
     require_csrf(&headers)?;
-    let review = state.store.skip_review(id).await?;
+    let review = store.skip_review(id).await?;
     Ok(Json(review))
 }
 
 async fn unskip_review(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     Path(id): Path<Uuid>,
     user: ActingUser,
     headers: HeaderMap,
 ) -> Result<Json<domain::Review>, ApiError> {
     require_write_role(user)?;
     require_csrf(&headers)?;
-    let review = state.store.unskip_review(id).await?;
+    let review = store.unskip_review(id).await?;
     Ok(Json(review))
 }
 
@@ -214,7 +207,7 @@ struct RegenerateResponse {
 }
 
 async fn regenerate_review(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     Path(id): Path<Uuid>,
     user: ActingUser,
     headers: HeaderMap,
@@ -222,7 +215,7 @@ async fn regenerate_review(
 ) -> Result<Json<RegenerateResponse>, ApiError> {
     require_write_role(user)?;
     require_csrf(&headers)?;
-    let review = state.store.transition_review_to_drafting(id).await?;
+    let review = store.transition_review_to_drafting(id).await?;
     Ok(Json(RegenerateResponse {
         review_id: review.id,
         status: review.status,
@@ -232,8 +225,8 @@ async fn regenerate_review(
 
 // --- Drafts ---
 
-async fn list_drafts(State(state): State<AppState>) -> Json<Vec<ReplyDraft>> {
-    Json(state.store.list_drafts().await)
+async fn list_drafts(State(store): State<Store>) -> Json<Vec<ReplyDraft>> {
+    Json(store.list_drafts().await)
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,7 +244,7 @@ struct ApproveResponse {
 }
 
 async fn approve_draft(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     Path(id): Path<Uuid>,
     user: ActingUser,
     headers: HeaderMap,
@@ -259,18 +252,18 @@ async fn approve_draft(
 ) -> Result<Json<ApproveResponse>, ApiError> {
     require_write_role(user)?;
     require_csrf(&headers)?;
-    if let Some(cached) = maybe_idempotent_success::<ApproveResponse>(&state.store, &headers).await?
+    if let Some(cached) = maybe_idempotent_success::<ApproveResponse>(&store, &headers).await?
     {
         return Ok(Json(cached));
     }
-    let updated = state.store.approve_draft(id, user.id, req.text).await?;
+    let updated = store.approve_draft(id, user.id, req.text).await?;
 
     let out = ApproveResponse {
         id: updated.id,
         state: updated.state,
         posted_at: updated.posted_at,
     };
-    store_idempotent_success(&state.store, &headers, &out).await;
+    store_idempotent_success(&store, &headers, &out).await;
     Ok(Json(out))
 }
 
@@ -280,7 +273,7 @@ struct RejectRequest {
 }
 
 async fn reject_draft(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     Path(id): Path<Uuid>,
     user: ActingUser,
     headers: HeaderMap,
@@ -288,11 +281,11 @@ async fn reject_draft(
 ) -> Result<Json<ReplyDraft>, ApiError> {
     require_write_role(user)?;
     require_csrf(&headers)?;
-    if let Some(cached) = maybe_idempotent_success::<ReplyDraft>(&state.store, &headers).await? {
+    if let Some(cached) = maybe_idempotent_success::<ReplyDraft>(&store, &headers).await? {
         return Ok(Json(cached));
     }
-    let updated = state.store.reject_draft(id, user.id, req.reason).await?;
-    store_idempotent_success(&state.store, &headers, &updated).await;
+    let updated = store.reject_draft(id, user.id, req.reason).await?;
+    store_idempotent_success(&store, &headers, &updated).await;
     Ok(Json(updated))
 }
 
@@ -302,7 +295,7 @@ struct BulkApproveRequest {
 }
 
 async fn bulk_approve(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     user: ActingUser,
     headers: HeaderMap,
     Json(req): Json<BulkApproveRequest>,
@@ -312,12 +305,12 @@ async fn bulk_approve(
     if user.role != domain::UserRole::Owner {
         return Err(ApiError::Forbidden);
     }
-    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&state.store, &headers).await?
+    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&store, &headers).await?
     {
         return Ok(Json(cached));
     }
-    let updated = state.store.bulk_approve(&req.ids, user.id).await?;
-    store_idempotent_success(&state.store, &headers, &updated).await;
+    let updated = store.bulk_approve(&req.ids, user.id).await?;
+    store_idempotent_success(&store, &headers, &updated).await;
     Ok(Json(updated))
 }
 
@@ -327,7 +320,7 @@ struct UndoBulkApproveRequest {
 }
 
 async fn undo_bulk_approve(
-    State(state): State<AppState>,
+    State(store): State<Store>,
     user: ActingUser,
     headers: HeaderMap,
     Json(req): Json<UndoBulkApproveRequest>,
@@ -337,15 +330,14 @@ async fn undo_bulk_approve(
     if user.role != domain::UserRole::Owner {
         return Err(ApiError::Forbidden);
     }
-    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&state.store, &headers).await?
+    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&store, &headers).await?
     {
         return Ok(Json(cached));
     }
-    let updated = state
-        .store
+    let updated = store
         .undo_bulk_approve(&req.ids, user.id, OffsetDateTime::now_utc())
         .await?;
-    store_idempotent_success(&state.store, &headers, &updated).await;
+    store_idempotent_success(&store, &headers, &updated).await;
     Ok(Json(updated))
 }
 

@@ -23,6 +23,11 @@ pub type RepositoryResult<T> = Result<T, RepositoryError>;
 /// an in-memory store (tests/dev) or Postgres (production).
 #[async_trait::async_trait]
 pub trait Repository: Send + Sync + 'static {
+    /// Lightweight dependency check for readiness probes.
+    ///
+    /// Implementations should perform a cheap round-trip (e.g. `SELECT 1` for Postgres).
+    async fn ping(&self) -> RepositoryResult<()>;
+
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>>;
     async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)>;
 
@@ -89,6 +94,13 @@ pub trait Repository: Send + Sync + 'static {
 
     async fn list_drafts(&self) -> RepositoryResult<Vec<ReplyDraft>>;
     async fn store_agent_draft(&self, draft: ReplyDraft) -> RepositoryResult<()>;
+
+    /// Persist a trace record for a single agent run.
+    async fn store_agent_run(&self, run: domain::AgentRun) -> RepositoryResult<()>;
+
+    /// List agent runs for a review, most recent first.
+    async fn list_agent_runs(&self, review_id: Uuid) -> RepositoryResult<Vec<domain::AgentRun>>;
+
     async fn approve_draft(
         &self,
         draft_id: Uuid,

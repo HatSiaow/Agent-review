@@ -18,7 +18,8 @@ pub fn router(store: Store) -> Router {
         .route("/healthz", get(v1::healthz))
         .route("/readyz", get(v1::readyz))
         .route("/metrics", get(v1::metrics))
-        .nest("/api/v1", v1::router(store.clone()))
-        .nest("/webhooks", webhooks::router(store))
+        .nest("/api/v1", v1::router())
+        .nest("/webhooks", webhooks::router())
         .layer(TraceLayer::new_for_http())
+        .with_state(store)
 }

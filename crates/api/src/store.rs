@@ -65,6 +65,10 @@ impl Store {
         self.repo.list_reviews().await.unwrap_or_default()
     }
 
+    pub async fn ping(&self) -> Result<(), ApiError> {
+        self.repo.ping().await.map_err(|_| ApiError::ServiceUnavailable)
+    }
+
     pub async fn get_review(&self, id: Uuid) -> Result<(Review, Option<ReplyDraft>), ApiError> {
         self.repo.get_review(id).await.map_err(|e| Self::map_err(&e))
     }
@@ -133,6 +137,14 @@ impl Store {
 
     pub async fn store_agent_draft(&self, draft: ReplyDraft) {
         let _ = self.repo.store_agent_draft(draft).await;
+    }
+
+    pub async fn store_agent_run(&self, run: domain::AgentRun) {
+        let _ = self.repo.store_agent_run(run).await;
+    }
+
+    pub async fn list_agent_runs(&self, review_id: Uuid) -> Vec<domain::AgentRun> {
+        self.repo.list_agent_runs(review_id).await.unwrap_or_default()
     }
 
     pub async fn transition_review_to_drafting(&self, review_id: Uuid) -> Result<Review, ApiError> {

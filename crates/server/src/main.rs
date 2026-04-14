@@ -138,7 +138,26 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
                     // Draft immediately for new reviews.
                     match agent::run_agent(llm.as_ref(), &agent_cfg, &review, None).await {
                         Ok(res) => {
+                            let draft_id = res.draft.id;
+                            let review_id = res.draft.review_id;
                             store.store_agent_draft(res.draft).await;
+
+                            let run = domain::AgentRun {
+                                id: uuid::Uuid::new_v4(),
+                                review_id,
+                                draft_id: Some(draft_id),
+                                model_name: Some(res.model_name),
+                                prompt_fingerprint: Some(res.prompt_fingerprint),
+                                prompt_tokens: Some(res.prompt_tokens),
+                                completion_tokens: Some(res.completion_tokens),
+                                latency_ms: Some(res.latency_ms),
+                                tool_calls_json: res.tool_calls_json,
+                                guardrail_verdict_json: serde_json::to_value(res.guardrail_result)
+                                    .ok(),
+                                error: None,
+                                created_at: time::OffsetDateTime::now_utc(),
+                            };
+                            store.store_agent_run(run).await;
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, review_id = %review.id, "agent drafting failed");

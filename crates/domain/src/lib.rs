@@ -15,7 +15,7 @@ pub use crate::guardrails::{
     GuardrailCheck, GuardrailContext, GuardrailResult, GuardrailVerdict, GuardrailWarning,
 };
 pub use crate::model::{
-    Generator, NotificationType, Platform, RejectionReason, ReplyDraft, Review, ReviewAuthor,
+    AgentRun, Generator, NotificationType, Platform, RejectionReason, ReplyDraft, Review, ReviewAuthor,
     ReviewStatus, UserRole,
 };
 pub use crate::review_fsm::{InvalidReviewTransition, ReviewEvent, ReviewFsm};

@@ -10,29 +10,24 @@ use sha2::Digest as _;
 
 use crate::Store;
 
-#[derive(Debug, Clone)]
-struct WebhookState {
-    store: Store,
-    ubereats_webhook_secret: Option<String>,
+fn ubereats_webhook_secret() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static SECRET: OnceLock<Option<String>> = OnceLock::new();
+    SECRET
+        .get_or_init(|| std::env::var("UBEREATS_WEBHOOK_SECRET").ok())
+        .as_deref()
 }
 
-pub fn router(store: Store) -> Router {
-    let state = WebhookState {
-        store,
-        ubereats_webhook_secret: std::env::var("UBEREATS_WEBHOOK_SECRET").ok(),
-    };
-
-    Router::new()
-        .route("/ubereats", post(ubereats_webhook))
-        .with_state(state)
+pub fn router() -> Router<Store> {
+    Router::new().route("/ubereats", post(ubereats_webhook))
 }
 
 async fn ubereats_webhook(
-    State(state): State<WebhookState>,
+    State(store): State<Store>,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    if let Some(ref secret) = state.ubereats_webhook_secret {
+    if let Some(secret) = ubereats_webhook_secret() {
         let signature = headers
             .get("x-uber-signature")
             .and_then(|v| v.to_str().ok())
@@ -67,8 +62,7 @@ async fn ubereats_webhook(
             hasher.update(&body);
             format!("sha256:{}", hex::encode(hasher.finalize()))
         });
-    let is_first = state
-        .store
+    let is_first = store
         .register_webhook_event(domain::Platform::Ubereats, &event_id, time::OffsetDateTime::now_utc())
         .await;
     if !is_first {
@@ -86,7 +80,7 @@ async fn ubereats_webhook(
         match normalize_ubereats_review(review_data) {
             Ok(review) => {
                 let review_id = review.id;
-                state.store.ingest_review(review).await;
+                store.ingest_review(review).await;
                 tracing::info!(%review_id, "ingested UberEats review from webhook");
             }
             Err(e) => {

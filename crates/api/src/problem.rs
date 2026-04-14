@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
@@ -26,6 +27,9 @@ pub enum ApiError {
     Forbidden,
     #[error("bad request: {0}")]
     BadRequest(&'static str),
+
+    #[error("service unavailable")]
+    ServiceUnavailable,
 }
 
 impl ApiError {
@@ -36,6 +40,7 @@ impl ApiError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -46,6 +51,7 @@ impl ApiError {
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
             Self::BadRequest(_) => "bad_request",
+            Self::ServiceUnavailable => "service_unavailable",
         }
     }
 
@@ -56,6 +62,7 @@ impl ApiError {
             Self::Unauthorized => "https://agent-review/errors/unauthorized",
             Self::Forbidden => "https://agent-review/errors/forbidden",
             Self::BadRequest(_) => "https://agent-review/errors/bad-request",
+            Self::ServiceUnavailable => "https://agent-review/errors/service-unavailable",
         }
     }
 }
@@ -69,6 +76,7 @@ impl IntoResponse for ApiError {
             Self::Unauthorized => "Unauthorized",
             Self::Forbidden => "Forbidden",
             Self::BadRequest(msg) => msg,
+            Self::ServiceUnavailable => "Service unavailable",
         };
 
         let body = ProblemDetails {
@@ -78,7 +86,12 @@ impl IntoResponse for ApiError {
             code: self.code(),
             instance: "",
         };
-        (status, Json(body)).into_response()
+        (
+            status,
+            [(header::CONTENT_TYPE, "application/problem+json")],
+            Json(body),
+        )
+            .into_response()
     }
 }
 

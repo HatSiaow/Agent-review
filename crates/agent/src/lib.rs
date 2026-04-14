@@ -156,10 +156,12 @@ fn build_tool_context(review: &Review) -> ToolContext {
 pub struct AgentRunResult {
     pub draft: ReplyDraft,
     pub model_name: String,
+    pub prompt_fingerprint: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub latency_ms: u64,
     pub tool_calls: u8,
+    pub tool_calls_json: serde_json::Value,
     pub guardrail_result: GuardrailResult,
 }
 
@@ -231,6 +233,8 @@ pub async fn run_agent<C: LlmClient + ?Sized>(
     let char_limit = review.reply_char_limit();
     let checks = domain::guardrails::default_checks();
     let tool_ctx = build_tool_context(review);
+    let tool_calls_json = serde_json::to_value(&tool_ctx.calls)
+        .unwrap_or_else(|_| serde_json::json!([]));
 
     let guardrail_ctx = GuardrailContext {
         platform: review.platform,
@@ -264,6 +268,7 @@ pub async fn run_agent<C: LlmClient + ?Sized>(
         };
 
         let response: GenerateResponse = llm.generate(request).await?;
+        let prompt_fingerprint = response.prompt_fingerprint.clone();
 
         total_prompt_tokens = total_prompt_tokens.saturating_add(response.prompt_tokens);
         total_completion_tokens = total_completion_tokens.saturating_add(response.completion_tokens);
@@ -294,6 +299,7 @@ pub async fn run_agent<C: LlmClient + ?Sized>(
                 review.body_language.clone().unwrap_or_else(|| "en".into()),
             );
             draft.model_name = Some(response.model_name);
+            draft.prompt_fingerprint = Some(prompt_fingerprint.clone());
             draft.generated_by = Generator::AgentLlm;
             let mut all_warnings: Vec<String> = guardrail_result
                 .warnings
@@ -310,10 +316,12 @@ pub async fn run_agent<C: LlmClient + ?Sized>(
             return Ok(AgentRunResult {
                 draft,
                 model_name: last_model_name,
+                prompt_fingerprint,
                 prompt_tokens: total_prompt_tokens,
                 completion_tokens: total_completion_tokens,
                 latency_ms: total_latency_ms,
                 tool_calls: tool_ctx.tool_calls_count(),
+                tool_calls_json,
                 guardrail_result,
             });
         }
