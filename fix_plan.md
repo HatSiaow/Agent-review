@@ -6,6 +6,9 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Implement real auth + sessions + CSRF + RBAC (owner/manager/viewer)** per `specs/coder/09-auth-and-secrets.md`, `specs/coder/06-human-in-the-loop-workflow.md`, `specs/coder/11-api-design.md`, `specs/coder/16-frontend-web-ui.md`.
     - Current gaps: no login/session middleware, no CSRF, no RBAC checks; mutation endpoints accept optional `user_id` in body.
     - Code: `crates/api/src/lib.rs`, `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs}`, `crates/storage/migrations/0001_init.sql`.
+  - **Implement secrets backend + encryption-at-rest plumbing** (the `Secrets` trait + `EnvFileSecrets`(age) + cloud backends + envelope encryption helper) per `specs/coder/09-auth-and-secrets.md` and `specs/coder/15-security-privacy-compliance.md`.
+    - Current gaps: no `Secrets` trait/implementations found in code; sensitive columns (e.g. `users.totp_secret`) are plaintext; adapters/LLM client read raw strings from env/config.
+    - Code: new crate/module (likely `crates/common` or a new `crates/secrets` + `crates/encryption`), plus storage migrations updates.
   - **Idempotency for mutating endpoints** (`Idempotency-Key` caching 24h) + webhook replay protection per `specs/coder/11-api-design.md` and `specs/coder/15-security-privacy-compliance.md`.
     - Code: `crates/api/src/v1.rs`, (new storage table or reuse outbox/idempotency store).
   - **Posting must be gated on explicit human approval, with correct state transitions and auditing** per `specs/coder/06-human-in-the-loop-workflow.md`.
@@ -38,7 +41,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/api/src/v1.rs`, storage query methods.
 
 - **P1 — Reliable workflow orchestration (ingestion → agent → approve → poster)**
-  - **Replace demo “scan loops” with durable job/outbox processing** per `specs/coder/01-architecture.md`, `specs/coder/07-notification-system.md`, `specs/coder/13-deployment-infra.md`.
+  - **Replace demo “scan loops” with durable job/outbox processing** per `specs/coder/01-architecture.md`, `specs/coder/07-notification-system.md`, `specs/coder/13-deployment-infra.md` and the new `specs/coder/17-work-queues-and-outbox-processing.md`.
     - Current `crates/server/src/main.rs` polls `list_reviews/list_drafts` every 2s and uses in-memory de-dupe; no durable queues/outbox claims.
     - Code: `crates/server/src/main.rs`, `crates/storage`, plus new queue/outbox abstractions.
   - **Ingestion orchestration** (Google polling with stop-at-watermark; UberEats webhook enqueues + polling fallback “since last created_at”; per-location sync state) per `specs/coder/02-google-reviews-integration.md`, `specs/coder/03-ubereats-reviews-integration.md`.
@@ -62,6 +65,9 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Compute and store `prompt_fingerprint`** (and version prompts) per `specs/coder/05-ai-response-agent.md`.
     - Current: column exists but not populated by the agent.
     - Code: `crates/agent/src/lib.rs`, `crates/domain/src/model.rs`, `crates/storage/src/pg.rs`.
+  - **Fix `llm_client` usage accounting and cost cap enforcement** per `specs/coder/05-ai-response-agent.md` and `specs/coder/13-deployment-infra.md`.
+    - Current gaps: prompt/completion tokens are always `0`; “usage logs” and monthly cost-cap enforcement are not implemented.
+    - Code: `crates/llm_client/src/lib.rs`.
   - **Tooling model: real tool-use protocol (JSON args/results + result hashes)** per `specs/coder/05-ai-response-agent.md`.
     - Current: “tools” are deterministic string context builders, not LLM-invoked tool calls.
     - Code: `crates/agent/src/lib.rs`, plus new tool interface crate/module.
@@ -84,4 +90,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/api/src/v1.rs`.
   - **Deployment scaffolding** (Dockerfile, config files, roles flags, CI steps) per `specs/coder/13-deployment-infra.md`.
   - **Testing layers called out in spec** (storage IT with testcontainers, e2e crate, eval binary, undo-window tests) per `specs/coder/14-testing-strategy.md`.
+  - **Finish CLI operational commands** (`google-auth` flow, token rotation, migrate status, replay tools) per `specs/coder/09-auth-and-secrets.md`, `specs/coder/08-data-storage.md`, `specs/coder/10-rust-tech-stack.md`.
+    - Current: `google-auth` and `migrate status` are placeholders.
+    - Code: `crates/cli/src/main.rs`.
 
