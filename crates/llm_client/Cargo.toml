@@ -1,5 +1,5 @@
 [package]
-name = "api"
+name = "llm-client"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,22 +8,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-adapter-ubereats = { path = "../adapters/ubereats" }
-axum.workspace = true
 domain = { path = "../domain" }
-hex.workspace = true
-hmac.workspace = true
-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
-time.workspace = true
 tokio.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-hyper.workspace = true
-tower.workspace = true
