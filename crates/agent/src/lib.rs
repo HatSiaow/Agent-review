@@ -221,7 +221,7 @@ const MAX_GUARDRAIL_RETRIES: u8 = 1;
 /// If guardrails fail on the first attempt, the agent retries once with a
 /// corrective system note appended to the hint. If the retry also fails,
 /// the draft is stored with guardrail warnings for human review.
-pub async fn run_agent<C: LlmClient>(
+pub async fn run_agent<C: LlmClient + ?Sized>(
     llm: &C,
     config: &AgentConfig,
     review: &Review,
