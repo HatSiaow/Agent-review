@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,7 +15,19 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {bind_addr}"))?;
 
     tracing::info!("listening on {}", listener.local_addr()?);
-    axum::serve(listener, app).await.context("serve")?;
+
+    let cancel = CancellationToken::new();
+    let cancel2 = cancel.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+        cancel2.cancel();
+    });
+
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move { cancel.cancelled().await });
+
+    server.await.context("serve")?;
     Ok(())
 }
 
