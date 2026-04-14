@@ -125,6 +125,44 @@ impl Store {
             .map_err(|_| ApiError::ServiceUnavailable)
     }
 
+    // --- Notifications outbox ---
+
+    pub async fn enqueue_notification_outbox(
+        &self,
+        id: Uuid,
+        occurred_at: OffsetDateTime,
+        notification_type: domain::NotificationType,
+        review_id: Option<Uuid>,
+        draft_id: Option<Uuid>,
+        payload_json: serde_json::Value,
+    ) {
+        let _ = self
+            .repo
+            .enqueue_notification_outbox(
+                id,
+                occurred_at,
+                notification_type,
+                review_id,
+                draft_id,
+                payload_json,
+            )
+            .await;
+    }
+
+    pub async fn claim_notification_outbox_batch(
+        &self,
+        limit: u32,
+    ) -> Vec<storage::NotificationOutboxItem> {
+        self.repo
+            .claim_notification_outbox_batch(limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn mark_notification_outbox_sent(&self, id: Uuid, sent_at: OffsetDateTime) {
+        let _ = self.repo.mark_notification_outbox_sent(id, sent_at).await;
+    }
+
     pub async fn get_review(&self, id: Uuid) -> Result<(Review, Option<ReplyDraft>), ApiError> {
         self.repo.get_review(id).await.map_err(|e| Self::map_err(&e))
     }

@@ -182,5 +182,47 @@ pub trait Repository: Send + Sync + 'static {
 
     /// Revoke a session.
     async fn delete_session(&self, session_id: Uuid) -> RepositoryResult<()>;
+
+    // --- Notifications outbox ---
+
+    /// Enqueue a notification delivery request into the durable outbox.
+    ///
+    /// This is the persistence boundary that makes notifications restart-safe.
+    async fn enqueue_notification_outbox(
+        &self,
+        id: Uuid,
+        occurred_at: OffsetDateTime,
+        notification_type: domain::NotificationType,
+        review_id: Option<Uuid>,
+        draft_id: Option<Uuid>,
+        payload_json: serde_json::Value,
+    ) -> RepositoryResult<()>;
+
+    /// Claim a batch of unsent outbox rows for delivery.
+    ///
+    /// Implementations should ensure that concurrent workers can safely claim
+    /// distinct rows (e.g. via `FOR UPDATE SKIP LOCKED`).
+    async fn claim_notification_outbox_batch(
+        &self,
+        limit: u32,
+    ) -> RepositoryResult<Vec<NotificationOutboxItem>>;
+
+    /// Mark an outbox item as sent.
+    async fn mark_notification_outbox_sent(
+        &self,
+        id: Uuid,
+        sent_at: OffsetDateTime,
+    ) -> RepositoryResult<()>;
+}
+
+/// A row claimed from `notifications_outbox` for delivery.
+#[derive(Debug, Clone)]
+pub struct NotificationOutboxItem {
+    pub id: Uuid,
+    pub occurred_at: OffsetDateTime,
+    pub notification_type: domain::NotificationType,
+    pub review_id: Option<Uuid>,
+    pub draft_id: Option<Uuid>,
+    pub payload_json: serde_json::Value,
 }
 

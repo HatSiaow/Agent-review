@@ -149,6 +149,20 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
                             let draft_id = res.draft.id;
                             let review_id = res.draft.review_id;
                             store.store_agent_draft(res.draft).await;
+                            store
+                                .enqueue_notification_outbox(
+                                    uuid::Uuid::new_v4(),
+                                    time::OffsetDateTime::now_utc(),
+                                    domain::NotificationType::DraftReady,
+                                    Some(review_id),
+                                    Some(draft_id),
+                                    serde_json::json!({
+                                        "review_id": review_id,
+                                        "draft_id": draft_id,
+                                        "kind": "draft_ready"
+                                    }),
+                                )
+                                .await;
 
                             let run = domain::AgentRun {
                                 id: uuid::Uuid::new_v4(),
@@ -263,6 +277,22 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
                         }
                         Err(e) => {
                             let _ = store.mark_draft_post_failed(draft.id, e.to_string()).await;
+                            store
+                                .enqueue_notification_outbox(
+                                    uuid::Uuid::new_v4(),
+                                    time::OffsetDateTime::now_utc(),
+                                    domain::NotificationType::PostFailed,
+                                    Some(review.id),
+                                    Some(draft.id),
+                                    serde_json::json!({
+                                        "review_id": review.id,
+                                        "draft_id": draft.id,
+                                        "platform": review.platform.to_string(),
+                                        "error": e.to_string(),
+                                        "kind": "post_failed"
+                                    }),
+                                )
+                                .await;
                         }
                     }
                 }
@@ -272,9 +302,30 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
 }
 
 async fn notifier_worker(store: api::Store, cancel: CancellationToken) {
-    // Minimal notifier: send DraftReady for new pending_review drafts once per draft id.
-    let mut sent: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-    let sender = notifier::InMemoryNotificationSender::default();
+    // Durable notifier: claim from the notifications outbox and mark sent on success.
+    #[derive(Debug)]
+    enum Sender {
+        Smtp(notifier::SmtpSender),
+        InMemory(notifier::InMemoryNotificationSender),
+    }
+
+    impl notifier::NotificationSender for Sender {
+        async fn send(
+            &self,
+            notification: &notifier::Notification,
+        ) -> Result<(), notifier::NotifierError> {
+            match self {
+                Sender::Smtp(s) => s.send(notification).await,
+                Sender::InMemory(s) => s.send(notification).await,
+            }
+        }
+    }
+
+    let sender = if let Some(cfg) = notifier::SmtpConfig::from_env() {
+        Sender::Smtp(notifier::SmtpSender::new(cfg))
+    } else {
+        Sender::InMemory(notifier::InMemoryNotificationSender::default())
+    };
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
 
     loop {
@@ -284,27 +335,46 @@ async fn notifier_worker(store: api::Store, cancel: CancellationToken) {
                 return;
             }
             _ = tick.tick() => {
-                let drafts = store.list_drafts().await;
-                for d in drafts {
-                    if d.state != domain::DraftState::PendingReview {
-                        continue;
-                    }
-                    if sent.contains(&d.id) {
-                        continue;
-                    }
-                    let _ = notifier::dispatch_notification(
+                let batch = store.claim_notification_outbox_batch(50).await;
+                for item in batch {
+                    // For v0.1, route all notifications to a single owner email address.
+                    // Later this should map to real users + preferences.
+                    let recipient = std::env::var("OWNER_NOTIFICATION_EMAIL")
+                        .unwrap_or_else(|_| "owner@example.com".to_string());
+
+                    let (subject, body) = match item.notification_type {
+                        domain::NotificationType::DraftReady => (
+                            "Draft ready".to_string(),
+                            "A reply draft is ready for review.".to_string(),
+                        ),
+                        domain::NotificationType::PostFailed => (
+                            "Reply failed to post".to_string(),
+                            "A reply failed to post and needs attention.".to_string(),
+                        ),
+                        _ => (
+                            format!("Notification: {}", item.notification_type),
+                            "A notification event occurred.".to_string(),
+                        ),
+                    };
+
+                    let results = notifier::dispatch_notification(
                         &sender,
                         &notifier::DispatchParams{
-                            notification_type: domain::NotificationType::DraftReady,
-                            recipient: "owner@example.com",
-                            subject: "Draft ready",
-                            body: "A reply draft is ready for review.",
-                            entity_id: Some(d.review_id),
+                            notification_type: item.notification_type,
+                            recipient: &recipient,
+                            subject: &subject,
+                            body: &body,
+                            entity_id: item.review_id.or(item.draft_id),
                             quiet_hours: None,
                             current_hour: 12,
                         }
                     ).await;
-                    sent.insert(d.id);
+
+                    if results.iter().all(Result::is_ok) {
+                        store.mark_notification_outbox_sent(item.id, time::OffsetDateTime::now_utc()).await;
+                    } else {
+                        tracing::warn!(outbox_id = %item.id, "notification delivery failed");
+                    }
                 }
             }
         }

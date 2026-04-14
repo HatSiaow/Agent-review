@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::repo::{Repository, RepositoryError, RepositoryResult};
+use crate::repo::{NotificationOutboxItem, Repository, RepositoryError, RepositoryResult};
 
 #[derive(Debug, Clone)]
 pub struct InMemoryRepository(Arc<Mutex<State>>);
@@ -28,6 +28,8 @@ struct State {
     users_auth: HashMap<Uuid, (String, Option<String>)>,
     users_by_email: HashMap<String, Uuid>,
     sessions: HashMap<Uuid, domain::Session>,
+    notification_outbox: HashMap<Uuid, NotificationOutboxItem>,
+    notification_outbox_sent_at: HashMap<Uuid, OffsetDateTime>,
 }
 
 impl InMemoryRepository {
@@ -57,7 +59,7 @@ impl Default for InMemoryRepository {
             use argon2::password_hash::{PasswordHasher as _, SaltString};
             use argon2::{Algorithm, Argon2, Params, Version};
 
-            let salt = SaltString::b64_encode(b"agent-review-seed-salt")
+            let salt = SaltString::encode_b64(b"agent-review-seed-salt")
                 .expect("seed salt must be encodable");
             let params = Params::new(65_536, 3, 1, None).expect("valid argon2 params");
             let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -623,7 +625,7 @@ impl Repository for InMemoryRepository {
             .users_auth
             .get(&id)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| (String::new(), None));
         Ok(Some(crate::repo::UserAuth {
             user,
             password_hash,
@@ -676,6 +678,55 @@ impl Repository for InMemoryRepository {
     async fn delete_session(&self, session_id: Uuid) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
         state.sessions.remove(&session_id);
+        Ok(())
+    }
+
+    async fn enqueue_notification_outbox(
+        &self,
+        id: Uuid,
+        occurred_at: OffsetDateTime,
+        notification_type: domain::NotificationType,
+        review_id: Option<Uuid>,
+        draft_id: Option<Uuid>,
+        payload_json: serde_json::Value,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        state.notification_outbox.entry(id).or_insert(NotificationOutboxItem {
+            id,
+            occurred_at,
+            notification_type,
+            review_id,
+            draft_id,
+            payload_json,
+        });
+        Ok(())
+    }
+
+    async fn claim_notification_outbox_batch(
+        &self,
+        limit: u32,
+    ) -> RepositoryResult<Vec<NotificationOutboxItem>> {
+        let state = self.0.lock().await;
+        let mut items: Vec<NotificationOutboxItem> = state
+            .notification_outbox
+            .values()
+            .filter(|i| !state.notification_outbox_sent_at.contains_key(&i.id))
+            .cloned()
+            .collect();
+        items.sort_by_key(|i| i.occurred_at);
+        items.truncate(limit as usize);
+        Ok(items)
+    }
+
+    async fn mark_notification_outbox_sent(
+        &self,
+        id: Uuid,
+        sent_at: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        if state.notification_outbox.contains_key(&id) {
+            state.notification_outbox_sent_at.insert(id, sent_at);
+        }
         Ok(())
     }
 }
@@ -864,6 +915,32 @@ mod tests {
         repo.mark_draft_posted(draft_id, eligible_at + time::Duration::seconds(1))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_enqueues_and_marks_sent() {
+        let repo = InMemoryRepository::new();
+        let id = Uuid::new_v4();
+        repo.enqueue_notification_outbox(
+            id,
+            datetime!(2026-04-10 12:00:00 UTC),
+            domain::NotificationType::DraftReady,
+            None,
+            None,
+            json!({"k":"v"}),
+        )
+        .await
+        .unwrap();
+
+        let batch = repo.claim_notification_outbox_batch(10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, id);
+
+        repo.mark_notification_outbox_sent(id, datetime!(2026-04-10 12:01:00 UTC))
+            .await
+            .unwrap();
+        let batch2 = repo.claim_notification_outbox_batch(10).await.unwrap();
+        assert!(batch2.is_empty());
     }
 }
 

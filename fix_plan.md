@@ -49,8 +49,25 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/poster/src/lib.rs`, `crates/server/src/main.rs`, adapters + storage.
 - **P1 — Notifications (owner should actually get notified, without noise)**
   - **Implement notifier outbox pipeline with idempotency store** per `specs/coder/07-notification-system.md`.
-    - Current: server sends “DraftReady” once per draft id via in-memory sender; outbox schema doesn’t match spec and is unused.
-    - Code: `crates/notifier/src/lib.rs`, `crates/storage/migrations/0001_init.sql`, `crates/server/src/main.rs`.
+    - Now implemented (v0.1 shape):
+      - Durable `notifications_outbox` repo API exists:
+        - `enqueue_notification_outbox`
+        - `claim_notification_outbox_batch`
+        - `mark_notification_outbox_sent`
+        - Code: `crates/storage/src/repo.rs`, `crates/storage/src/{pg.rs,memory.rs}`, `crates/api/src/store.rs`.
+      - Server notifier worker consumes the outbox (restart-safe / durable semantics):
+        - Periodically claims a batch from `notifications_outbox` and marks rows `sent_at` on successful delivery.
+        - Code: `crates/server/src/main.rs` (`notifier_worker`).
+      - Domain events enqueue outbox entries:
+        - `DraftReady` enqueues an outbox row when a draft becomes ready for review.
+        - `PostFailed` enqueues an outbox row when posting fails (after retries).
+        - Code: `crates/server/src/main.rs` (draft-ready enqueue + post-failed enqueue).
+    - Remaining gaps vs specs:
+      - Batching/digest: no hourly digest bucketing for `draft_ready` (spec wants digest for 4–5★).
+      - Quiet hours: `NOTIFIER_QUIET_HOURS` and suppression logic not wired through the worker (currently `quiet_hours: None`).
+      - SLA timers: `sla_breach` / `sla_escalation` / 72h auto-skip not implemented (requires timers + durable scheduling).
+      - `work_jobs` integration: spec `17` expects `work_jobs(notifier_dispatch)` to drive dispatch and then claim outbox rows; current implementation polls outbox directly (no `work_jobs` table/job state machine yet).
+      - Richer schema + idempotency store: spec `07/08` describe more fields (state/scheduled_for/channels/event_id+channel idempotency); current table is minimal (`sent_at`-based) and doesn’t yet model per-channel idempotency or scheduled delivery.
   - **Digest batching + quiet hours** per `specs/coder/07-notification-system.md`.
   - **SLA timers** (2h breach, 24h escalation, 72h auto-skip) per `specs/coder/06-human-in-the-loop-workflow.md`.
 - **P2 — Agent quality + traceability**

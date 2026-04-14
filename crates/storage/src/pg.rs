@@ -4,7 +4,7 @@ use time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
 
-use crate::repo::{Repository, RepositoryError, RepositoryResult};
+use crate::repo::{NotificationOutboxItem, Repository, RepositoryError, RepositoryResult};
 
 #[derive(Debug, Clone)]
 pub struct PgRepositoryConfig {
@@ -1323,6 +1323,106 @@ impl Repository for PgRepository {
     async fn delete_session(&self, session_id: Uuid) -> RepositoryResult<()> {
         sqlx::query("delete from sessions where id = $1")
             .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn enqueue_notification_outbox(
+        &self,
+        id: Uuid,
+        occurred_at: OffsetDateTime,
+        notification_type: domain::NotificationType,
+        review_id: Option<Uuid>,
+        draft_id: Option<Uuid>,
+        payload_json: serde_json::Value,
+    ) -> RepositoryResult<()> {
+        sqlx::query(
+            r"
+            insert into notifications_outbox (
+              id, occurred_at, notification_type, review_id, draft_id, payload_json, sent_at
+            ) values ($1,$2,$3,$4,$5,$6,null)
+            on conflict (id) do nothing
+            ",
+        )
+        .bind(id)
+        .bind(occurred_at)
+        .bind(notification_type.to_string())
+        .bind(review_id)
+        .bind(draft_id)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn claim_notification_outbox_batch(
+        &self,
+        limit: u32,
+    ) -> RepositoryResult<Vec<NotificationOutboxItem>> {
+        #[derive(Debug, Clone, sqlx::FromRow)]
+        struct OutboxRow {
+            id: Uuid,
+            occurred_at: OffsetDateTime,
+            notification_type: String,
+            review_id: Option<Uuid>,
+            draft_id: Option<Uuid>,
+            payload_json: serde_json::Value,
+        }
+
+        let rows: Vec<OutboxRow> = sqlx::query_as(
+            r"
+            select id, occurred_at, notification_type, review_id, draft_id, payload_json
+            from notifications_outbox
+            where sent_at is null
+            order by occurred_at asc
+            for update skip locked
+            limit $1
+            ",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let nt = match r.notification_type.as_str() {
+                "draft_ready" => domain::NotificationType::DraftReady,
+                "sensitive_review" => domain::NotificationType::SensitiveReview,
+                "sla_breach" => domain::NotificationType::SlaBreach,
+                "sla_escalation" => domain::NotificationType::SlaEscalation,
+                "ingestion_failure" => domain::NotificationType::IngestionFailure,
+                "post_failed" => domain::NotificationType::PostFailed,
+                "drift_detected" => domain::NotificationType::DriftDetected,
+                _ => {
+                    return Err(RepositoryError::Storage(
+                        "invalid notification_type".to_string(),
+                    ))
+                }
+            };
+            out.push(NotificationOutboxItem {
+                id: r.id,
+                occurred_at: r.occurred_at,
+                notification_type: nt,
+                review_id: r.review_id,
+                draft_id: r.draft_id,
+                payload_json: r.payload_json,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn mark_notification_outbox_sent(
+        &self,
+        id: Uuid,
+        sent_at: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        sqlx::query("update notifications_outbox set sent_at = $1 where id = $2")
+            .bind(sent_at)
+            .bind(id)
             .execute(&self.pool)
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
