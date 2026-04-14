@@ -142,6 +142,273 @@ pub trait NotificationSender: Send + Sync {
     ) -> impl Future<Output = Result<(), NotifierError>> + Send;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub from: String,
+}
+
+impl SmtpConfig {
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let host = std::env::var("SMTP_HOST").ok()?;
+        let port = std::env::var("SMTP_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(587);
+        let from = std::env::var("SMTP_FROM").ok()?;
+        let username = std::env::var("SMTP_USERNAME").ok();
+        let password = std::env::var("SMTP_PASSWORD").ok();
+        Some(Self {
+            host,
+            port,
+            username,
+            password,
+            from,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SmtpSender {
+    cfg: SmtpConfig,
+}
+
+impl SmtpSender {
+    #[must_use]
+    pub fn new(cfg: SmtpConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl NotificationSender for SmtpSender {
+    async fn send(&self, notification: &Notification) -> Result<(), NotifierError> {
+        if notification.channel != Channel::Email {
+            return Ok(());
+        }
+
+        let from = self
+            .cfg
+            .from
+            .parse()
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+        let to = notification
+            .recipient
+            .parse()
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let email = lettre::Message::builder()
+            .from(from)
+            .to(to)
+            .subject(notification.subject.clone())
+            .body(notification.body.clone())
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let creds = match (&self.cfg.username, &self.cfg.password) {
+            (Some(u), Some(p)) => Some(lettre::transport::smtp::authentication::Credentials::new(
+                u.clone(),
+                p.clone(),
+            )),
+            _ => None,
+        };
+
+        let mut builder = lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::relay(&self.cfg.host)
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+        builder = builder.port(self.cfg.port);
+        if let Some(creds) = creds {
+            builder = builder.credentials(creds);
+        }
+        let transport = builder.build();
+
+        transport
+            .send(email)
+            .await
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwilioConfig {
+    pub account_sid: String,
+    pub auth_token: String,
+    pub from_number: String,
+}
+
+impl TwilioConfig {
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        Some(Self {
+            account_sid: std::env::var("TWILIO_ACCOUNT_SID").ok()?,
+            auth_token: std::env::var("TWILIO_AUTH_TOKEN").ok()?,
+            from_number: std::env::var("TWILIO_FROM_NUMBER").ok()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TwilioSmsSender {
+    cfg: TwilioConfig,
+    http: reqwest::Client,
+}
+
+impl TwilioSmsSender {
+    #[must_use]
+    pub fn new(cfg: TwilioConfig) -> Self {
+        Self {
+            cfg,
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+impl NotificationSender for TwilioSmsSender {
+    async fn send(&self, notification: &Notification) -> Result<(), NotifierError> {
+        if notification.channel != Channel::Sms {
+            return Ok(());
+        }
+
+        let url = format!(
+            "https://api.twilio.com/2010-04-01/Accounts/{}/Messages.json",
+            self.cfg.account_sid
+        );
+
+        let res = self
+            .http
+            .post(url)
+            .basic_auth(&self.cfg.account_sid, Some(&self.cfg.auth_token))
+            .form(&[
+                ("From", self.cfg.from_number.as_str()),
+                ("To", notification.recipient.as_str()),
+                ("Body", notification.body.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        if !res.status().is_success() {
+            let status = res.status().as_u16();
+            let body = res.text().await.unwrap_or_default();
+            return Err(NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: format!("twilio status {status}: {body}"),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebPushConfig {
+    pub vapid_public_key: String,
+    pub vapid_private_key: String,
+    pub subject: String,
+}
+
+impl WebPushConfig {
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        Some(Self {
+            vapid_public_key: std::env::var("VAPID_PUBLIC_KEY").ok()?,
+            vapid_private_key: std::env::var("VAPID_PRIVATE_KEY").ok()?,
+            subject: std::env::var("VAPID_SUBJECT").unwrap_or_else(|_| "mailto:owner@example.com".into()),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WebPushSender {
+    cfg: WebPushConfig,
+}
+
+impl WebPushSender {
+    #[must_use]
+    pub fn new(cfg: WebPushConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl NotificationSender for WebPushSender {
+    async fn send(&self, notification: &Notification) -> Result<(), NotifierError> {
+        if notification.channel != Channel::Push {
+            return Ok(());
+        }
+
+        // In this repo we treat `recipient` as a subscription endpoint URL.
+        let endpoint = notification
+            .recipient
+            .parse()
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        // Minimal: send a plaintext payload; real impl would store p256dh/auth per subscription.
+        let subscription_info = web_push::SubscriptionInfo::new(endpoint, String::new(), String::new());
+
+        let sig_builder = web_push::VapidSignatureBuilder::from_base64(
+            &self.cfg.vapid_public_key,
+            &self.cfg.vapid_private_key,
+            &subscription_info,
+        )
+        .map_err(|e| NotifierError::DeliveryFailed {
+            channel: notification.channel.to_string(),
+            reason: e.to_string(),
+        })?
+        .build()
+        .map_err(|e| NotifierError::DeliveryFailed {
+            channel: notification.channel.to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let mut builder = web_push::WebPushMessageBuilder::new(&subscription_info)
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+        builder.set_payload(web_push::ContentEncoding::AesGcm, notification.body.as_bytes());
+        builder.set_vapid_signature(sig_builder);
+
+        let client = web_push::WebPushClient::new().map_err(|e| NotifierError::DeliveryFailed {
+            channel: notification.channel.to_string(),
+            reason: e.to_string(),
+        })?;
+        client
+            .send(builder.build().map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?)
+            .await
+            .map_err(|e| NotifierError::DeliveryFailed {
+                channel: notification.channel.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        Ok(())
+    }
+}
+
 /// Parameters for dispatching a notification.
 #[derive(Debug, Clone)]
 pub struct DispatchParams<'a> {
