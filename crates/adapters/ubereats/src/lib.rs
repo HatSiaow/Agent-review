@@ -124,9 +124,8 @@ impl HttpUberEatsClient {
             let delta = now - last;
             let min = time::Duration::milliseconds(200);
             if delta < min {
-                let sleep_for = (min - delta)
-                    .whole_milliseconds()
-                    .max(0) as u64;
+                let ms = (min - delta).whole_milliseconds().max(0);
+                let sleep_for = u64::try_from(ms).unwrap_or(0);
                 std::thread::sleep(std::time::Duration::from_millis(sleep_for));
             }
         }
@@ -169,7 +168,7 @@ impl HttpUberEatsClient {
         let tr: TokenResponse = resp
             .json()
             .map_err(|e| UberEatsAdapterError::ParseError(e.to_string()))?;
-        if tr.token_type.to_ascii_lowercase() != "bearer" {
+        if !tr.token_type.eq_ignore_ascii_case("bearer") {
             return Err(UberEatsAdapterError::AuthError);
         }
         let expires_at =

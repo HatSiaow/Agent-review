@@ -202,7 +202,7 @@ impl HttpGoogleClient {
     fn authed_get_json(
         &self,
         cfg: &GoogleConfig,
-        url: Url,
+        url: &Url,
     ) -> Result<serde_json::Value, GoogleAdapterError> {
         Self::with_retry(|| {
             let token = self.get_access_token(cfg)?;
@@ -297,7 +297,7 @@ impl GoogleReviewClient for HttpGoogleClient {
         let mut page_token: Option<String> = None;
         loop {
             let url = Self::build_reviews_list_url(config, page_token.as_deref())?;
-            let v = self.authed_get_json(config, url)?;
+            let v = self.authed_get_json(config, &url)?;
 
             let reviews = v["reviews"]
                 .as_array()
