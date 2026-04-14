@@ -73,6 +73,9 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/agent/src/lib.rs`, plus new tool interface crate/module.
   - **Guardrail rule alignment** (refund promise allowlist/policy patterns, supported language config, restaurant-name self-reference alternative) per `specs/coder/05-ai-response-agent.md`.
     - Code: `crates/domain/src/guardrails.rs`.
+  - **Replace hard-coded “Chez Luca” defaults with persisted restaurant settings** (name, cuisine, hours, signature dishes, voice) per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md` (`/api/v1/settings`).
+    - Current: agent config and prompts embed demo defaults; no settings endpoints/storage exist.
+    - Code: `crates/agent/src/lib.rs`, `crates/llm_client/src/lib.rs`, `crates/api/src/v1.rs`, `crates/storage` (new table), UI templates.
 
 - **P2 — Spec-complete platform behaviors**
   - **Google adapter watermark + stop paging** + configurable host/path, jittered backoff up to 5 minutes, drift detection/withdrawn handling per `specs/coder/02-google-reviews-integration.md`.
@@ -88,6 +91,12 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Readiness checks** (DB + secrets reachable) per `specs/coder/12-observability.md` and `specs/coder/11-api-design.md`.
     - Current `readyz` is unconditional “ok”.
     - Code: `crates/api/src/v1.rs`.
+  - **Implement config loading via `figment` + `APP_ENV` + `APP_` env prefix** per `specs/coder/13-deployment-infra.md` and `specs/coder/10-rust-tech-stack.md`.
+    - Current: ad-hoc env reads, inconsistent naming (`APP_BIND_ADDR` vs `DATABASE_URL` vs `ANTHROPIC_API_KEY`), and no `config/` directory.
+    - Code: `crates/common`, all binaries, `crates/storage/src/pg.rs`.
+  - **Server role selection flag (`--roles`) and SIGTERM shutdown** per `specs/coder/10-rust-tech-stack.md` and `specs/coder/13-deployment-infra.md`.
+    - Current: server always starts all workers; shutdown listens to Ctrl+C only.
+    - Code: `crates/server/src/main.rs`.
   - **Deployment scaffolding** (Dockerfile, config files, roles flags, CI steps) per `specs/coder/13-deployment-infra.md`.
   - **Testing layers called out in spec** (storage IT with testcontainers, e2e crate, eval binary, undo-window tests) per `specs/coder/14-testing-strategy.md`.
   - **Finish CLI operational commands** (`google-auth` flow, token rotation, migrate status, replay tools) per `specs/coder/09-auth-and-secrets.md`, `specs/coder/08-data-storage.md`, `specs/coder/10-rust-tech-stack.md`.
