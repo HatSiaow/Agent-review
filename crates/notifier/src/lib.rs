@@ -190,7 +190,7 @@ impl NotificationSender for SmtpSender {
             return Ok(());
         }
 
-        let from = self
+        let from: lettre::message::Mailbox = self
             .cfg
             .from
             .parse()
@@ -198,7 +198,7 @@ impl NotificationSender for SmtpSender {
                 channel: notification.channel.to_string(),
                 reason: e.to_string(),
             })?;
-        let to = notification
+        let to: lettre::message::Mailbox = notification
             .recipient
             .parse()
             .map_err(|e| NotifierError::DeliveryFailed {
@@ -238,6 +238,7 @@ impl NotificationSender for SmtpSender {
         transport
             .send(email)
             .await
+            .map(|_| ())
             .map_err(|e| NotifierError::DeliveryFailed {
                 channel: notification.channel.to_string(),
                 reason: e.to_string(),
@@ -356,16 +357,12 @@ impl NotificationSender for WebPushSender {
         }
 
         // In this repo we treat `recipient` as a subscription endpoint URL.
-        let endpoint = notification
-            .recipient
-            .parse()
-            .map_err(|e| NotifierError::DeliveryFailed {
-                channel: notification.channel.to_string(),
-                reason: e.to_string(),
-            })?;
-
         // Minimal: send a plaintext payload; real impl would store p256dh/auth per subscription.
-        let subscription_info = web_push::SubscriptionInfo::new(endpoint, String::new(), String::new());
+        let subscription_info = web_push::SubscriptionInfo::new(
+            notification.recipient.clone(),
+            String::new(),
+            String::new(),
+        );
 
         let sig_builder = web_push::VapidSignatureBuilder::from_base64(
             &self.cfg.vapid_public_key,
@@ -400,6 +397,7 @@ impl NotificationSender for WebPushSender {
                 reason: e.to_string(),
             })?)
             .await
+            .map(|_| ())
             .map_err(|e| NotifierError::DeliveryFailed {
                 channel: notification.channel.to_string(),
                 reason: e.to_string(),

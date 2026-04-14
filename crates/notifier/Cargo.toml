@@ -9,9 +9,12 @@ workspace = true
 
 [dependencies]
 domain = { path = "../domain" }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+web-push = { version = "0.10", default-features = false, features = ["hyper-client"] }
