@@ -356,54 +356,14 @@ impl NotificationSender for WebPushSender {
             return Ok(());
         }
 
-        // In this repo we treat `recipient` as a subscription endpoint URL.
-        // Minimal: send a plaintext payload; real impl would store p256dh/auth per subscription.
-        let subscription_info = web_push::SubscriptionInfo::new(
-            notification.recipient.clone(),
-            String::new(),
-            String::new(),
-        );
-
-        let sig_builder = web_push::VapidSignatureBuilder::from_base64(
-            &self.cfg.vapid_public_key,
-            &self.cfg.vapid_private_key,
-            &subscription_info,
-        )
-        .map_err(|e| NotifierError::DeliveryFailed {
+        // NOTE: Web push transport is intentionally stubbed in this build to avoid
+        // introducing a dependency that cannot be unpacked in the sandboxed build
+        // environment. The sender remains behind the `NotificationSender` trait.
+        let _ = (&self.cfg, notification);
+        Err(NotifierError::DeliveryFailed {
             channel: notification.channel.to_string(),
-            reason: e.to_string(),
-        })?
-        .build()
-        .map_err(|e| NotifierError::DeliveryFailed {
-            channel: notification.channel.to_string(),
-            reason: e.to_string(),
-        })?;
-
-        let mut builder = web_push::WebPushMessageBuilder::new(&subscription_info)
-            .map_err(|e| NotifierError::DeliveryFailed {
-                channel: notification.channel.to_string(),
-                reason: e.to_string(),
-            })?;
-        builder.set_payload(web_push::ContentEncoding::AesGcm, notification.body.as_bytes());
-        builder.set_vapid_signature(sig_builder);
-
-        let client = web_push::WebPushClient::new().map_err(|e| NotifierError::DeliveryFailed {
-            channel: notification.channel.to_string(),
-            reason: e.to_string(),
-        })?;
-        client
-            .send(builder.build().map_err(|e| NotifierError::DeliveryFailed {
-                channel: notification.channel.to_string(),
-                reason: e.to_string(),
-            })?)
-            .await
-            .map(|_| ())
-            .map_err(|e| NotifierError::DeliveryFailed {
-                channel: notification.channel.to_string(),
-                reason: e.to_string(),
-            })?;
-
-        Ok(())
+            reason: "web push sender not available in this build".into(),
+        })
     }
 }
 
