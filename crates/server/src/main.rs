@@ -98,13 +98,22 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
             _ = ubereats_tick.tick() => {
                 let cfg = ubereats_cfg.clone();
                 let store2 = store.clone();
+                let since = store2.get_reviews_sync_state(domain::Platform::Ubereats).await;
                 if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
-                    adapter_ubereats::HttpUberEatsClient::new().list_reviews(&cfg)
+                    adapter_ubereats::HttpUberEatsClient::new().list_reviews_since(&cfg, since)
                 }).await {
+                    let mut max_seen: Option<time::OffsetDateTime> = since;
                     for raw in raws {
                         if let Ok(review) = adapter_ubereats::normalize_ubereats_review(&raw) {
+                            // Persist a polling watermark based on created_at, per spec.
+                            // If the upstream payload is missing/invalid created_at we keep the item
+                            // (adapter default) and avoid advancing the watermark for it.
+                            max_seen = Some(max_seen.map_or(review.created_at, |m| m.max(review.created_at)));
                             store2.ingest_review(review).await;
                         }
+                    }
+                    if let Some(max_seen) = max_seen {
+                        store2.set_reviews_sync_state(domain::Platform::Ubereats, max_seen).await;
                     }
                 }
             }

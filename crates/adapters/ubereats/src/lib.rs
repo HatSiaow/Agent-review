@@ -11,6 +11,7 @@ use domain::Review;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use url::Url;
 
 #[derive(Debug, Error)]
@@ -64,12 +65,49 @@ pub trait UberEatsReviewClient: Send + Sync {
         config: &UberEatsConfig,
     ) -> Result<Vec<serde_json::Value>, UberEatsAdapterError>;
 
+    /// List reviews created strictly after `since` (if provided).
+    ///
+    /// Why: the UberEats spec requires a polling fallback that only scans reviews
+    /// newer than the last known `created_at`, so the system does not re-process
+    /// the full review list every poll.
+    ///
+    /// Note: the public UberEats endpoint parameters vary; this method provides the
+    /// *semantic* contract and can be implemented either via server-side filtering
+    /// (query parameter) or client-side filtering (default implementation).
+    fn list_reviews_since(
+        &self,
+        config: &UberEatsConfig,
+        since: Option<OffsetDateTime>,
+    ) -> Result<Vec<serde_json::Value>, UberEatsAdapterError> {
+        let raws = self.list_reviews(config)?;
+        let Some(since) = since else {
+            return Ok(raws);
+        };
+        Ok(raws
+            .into_iter()
+            .filter(|v| match extract_created_at(v) {
+                Ok(Some(t)) => t > since,
+                // If we cannot parse created_at, keep the review to avoid missing it.
+                _ => true,
+            })
+            .collect())
+    }
+
     fn post_reply(
         &self,
         config: &UberEatsConfig,
         review_id: &str,
         reply_text: &str,
     ) -> Result<(), UberEatsAdapterError>;
+}
+
+fn extract_created_at(v: &serde_json::Value) -> Result<Option<OffsetDateTime>, UberEatsAdapterError> {
+    let Some(s) = v.get("created_at").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    OffsetDateTime::parse(s, &Rfc3339)
+        .map(Some)
+        .map_err(|e| UberEatsAdapterError::ParseError(format!("created_at parse: {e}")))
 }
 
 #[derive(Debug)]
