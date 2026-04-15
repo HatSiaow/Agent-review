@@ -20,6 +20,7 @@ secrets = { path = "../secrets" }
 secrecy.workspace = true
 hex.workspace = true
 hmac.workspace = true
+rand.workspace = true
 http.workspace = true
 metrics = "0.22"
 metrics-exporter-prometheus = "0.15"

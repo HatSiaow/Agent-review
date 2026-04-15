@@ -1762,4 +1762,95 @@ impl Repository for PgRepository {
         }
         Ok(())
     }
+
+    async fn create_password_reset_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into password_reset_tokens (id, user_id, token_hash, created_at, expires_at)
+            values ($1, $2, $3, $4, $5)
+            on conflict (token_hash) do nothing
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(id)
+    }
+
+    async fn consume_password_reset_token(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<Uuid>> {
+        let result: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            update password_reset_tokens
+            set used_at = $1
+            where token_hash = $2
+              and expires_at > $1
+              and used_at is null
+            returning user_id
+            "#,
+        )
+        .bind(now)
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
+    async fn update_user_password_hash(
+        &self,
+        user_id: Uuid,
+        new_password_hash: &str,
+    ) -> RepositoryResult<()> {
+        let rows = sqlx::query("update users set password_hash = $1 where id = $2")
+            .bind(new_password_hash)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
+        if rows == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::User,
+            Some(user_id),
+            "user",
+            user_id,
+            domain::EventType::PasswordReset,
+            serde_json::json!({}),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn gc_delete_expired_reset_tokens(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            "delete from password_reset_tokens where expires_at < $1 or used_at is not null",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
 }

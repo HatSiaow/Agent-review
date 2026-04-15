@@ -304,6 +304,43 @@ pub trait Repository: Send + Sync + 'static {
     /// Revoke a session.
     async fn delete_session(&self, session_id: Uuid) -> RepositoryResult<()>;
 
+    // --- Password reset ---
+
+    /// Create a password reset token for a user. Only the SHA-256 hash is stored.
+    /// Returns the generated token id. Callers are responsible for delivering the raw
+    /// token to the user (e.g. via email). Expires after 30 minutes.
+    async fn create_password_reset_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Uuid>;
+
+    /// Atomically verify and consume a password reset token.
+    ///
+    /// Returns the `user_id` when the token is valid (not expired, not yet used).
+    /// Marks the token as used by setting `used_at`. Returns `None` if the token
+    /// is unknown, already used, or expired.
+    async fn consume_password_reset_token(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<Uuid>>;
+
+    /// Replace a user's stored password hash (called after a successful reset).
+    /// Returns `RepositoryError::NotFound` if `user_id` does not exist.
+    async fn update_user_password_hash(
+        &self,
+        user_id: Uuid,
+        new_password_hash: &str,
+    ) -> RepositoryResult<()>;
+
+    /// Garbage-collect expired and already-used password reset tokens.
+    /// Deletes rows where `expires_at < cutoff` or `used_at is not null`.
+    /// Returns the number of rows deleted.
+    async fn gc_delete_expired_reset_tokens(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64>;
+
     // --- Notifications outbox ---
 
     /// Enqueue a notification delivery request into the durable outbox.
@@ -376,6 +413,36 @@ pub trait Repository: Send + Sync + 'static {
         run_after: OffsetDateTime,
         now: OffsetDateTime,
     ) -> RepositoryResult<()>;
+
+    // --- Garbage collection ---
+
+    /// Redact `raw_payload` on reviews older than `cutoff`, replacing it with `{}`.
+    ///
+    /// Returns the number of rows affected.
+    async fn gc_redact_raw_payloads(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64>;
+
+    /// Delete `agent_runs` rows older than `cutoff`.
+    ///
+    /// Returns the number of rows deleted.
+    async fn gc_delete_agent_runs(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64>;
+
+    /// Delete sent `notifications_outbox` rows whose `sent_at` is older than `cutoff`.
+    ///
+    /// Returns the number of rows deleted.
+    async fn gc_delete_sent_notifications(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64>;
+
+    /// Delete `webhook_events` rows older than `cutoff`.
+    ///
+    /// Returns the number of rows deleted.
+    async fn gc_delete_old_webhook_events(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64>;
+
+    /// Delete expired `idempotency_responses` rows older than `cutoff`.
+    ///
+    /// Returns the number of rows deleted.
+    async fn gc_delete_expired_idempotency_keys(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64>;
 }
 
 /// A row claimed from `notifications_outbox` for delivery.

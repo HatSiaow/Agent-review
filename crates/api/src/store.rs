@@ -207,6 +207,43 @@ impl Store {
             .map_err(|_| ApiError::ServiceUnavailable)
     }
 
+    // --- Password reset ---
+
+    pub async fn create_password_reset_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Uuid, ApiError> {
+        self.repo
+            .create_password_reset_token(user_id, token_hash, expires_at, now)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn consume_password_reset_token(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Uuid>, ApiError> {
+        self.repo
+            .consume_password_reset_token(token_hash, now)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
+    }
+
+    pub async fn update_user_password_hash(
+        &self,
+        user_id: Uuid,
+        new_password_hash: &str,
+    ) -> Result<(), ApiError> {
+        self.repo
+            .update_user_password_hash(user_id, new_password_hash)
+            .await
+            .map_err(|e| Self::map_err(&e))
+    }
+
     // --- Notifications outbox ---
 
     pub async fn enqueue_notification_outbox(
@@ -318,7 +355,19 @@ impl Store {
     }
 
     pub async fn ingest_review(&self, review: Review) {
+        let review_id = review.id;
         let _ = self.repo.ingest_review(review).await;
+        let now = time::OffsetDateTime::now_utc();
+        self.enqueue_work_job(
+            uuid::Uuid::new_v4(),
+            storage::WorkJobType::AgentDraftReview,
+            &format!("agent_draft_review:{review_id}"),
+            serde_json::json!({ "review_id": review_id }),
+            now,
+            5,
+            now,
+        )
+        .await;
     }
 
     pub async fn get_reviews_sync_state(
@@ -411,10 +460,23 @@ impl Store {
         reviewed_by: Uuid,
         new_text: Option<String>,
     ) -> Result<ReplyDraft, ApiError> {
-        self.repo
+        let draft = self
+            .repo
             .approve_draft(draft_id, reviewed_by, new_text)
             .await
-            .map_err(|e| Self::map_err(&e))
+            .map_err(|e| Self::map_err(&e))?;
+        let now = time::OffsetDateTime::now_utc();
+        self.enqueue_work_job(
+            uuid::Uuid::new_v4(),
+            storage::WorkJobType::PosterPostReply,
+            &format!("poster_post_reply:{draft_id}"),
+            serde_json::json!({ "draft_id": draft_id, "review_id": draft.review_id }),
+            now,
+            5,
+            now,
+        )
+        .await;
+        Ok(draft)
     }
 
     pub async fn reject_draft(
@@ -448,10 +510,26 @@ impl Store {
         draft_ids: &[Uuid],
         reviewed_by: Uuid,
     ) -> Result<Vec<ReplyDraft>, ApiError> {
-        self.repo
+        let drafts = self
+            .repo
             .bulk_approve(draft_ids, reviewed_by)
             .await
-            .map_err(|e| Self::map_err(&e))
+            .map_err(|e| Self::map_err(&e))?;
+        let now = time::OffsetDateTime::now_utc();
+        let run_after = now + time::Duration::seconds(10);
+        for draft in &drafts {
+            self.enqueue_work_job(
+                uuid::Uuid::new_v4(),
+                storage::WorkJobType::PosterPostReply,
+                &format!("poster_post_reply:{}", draft.id),
+                serde_json::json!({ "draft_id": draft.id, "review_id": draft.review_id }),
+                run_after,
+                5,
+                now,
+            )
+            .await;
+        }
+        Ok(drafts)
     }
 
     pub async fn undo_bulk_approve(
@@ -486,5 +564,47 @@ impl Store {
             .mark_draft_post_failed(draft_id, error)
             .await
             .map_err(|e| Self::map_err(&e))
+    }
+
+    // --- Garbage collection ---
+
+    /// Redact `raw_payload` on reviews ingested before `cutoff`.
+    pub async fn gc_redact_raw_payloads(&self, cutoff: time::OffsetDateTime) -> u64 {
+        self.repo
+            .gc_redact_raw_payloads(cutoff)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Delete `agent_runs` rows created before `cutoff`.
+    pub async fn gc_delete_agent_runs(&self, cutoff: time::OffsetDateTime) -> u64 {
+        self.repo
+            .gc_delete_agent_runs(cutoff)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Delete sent `notifications_outbox` rows whose `sent_at` is before `cutoff`.
+    pub async fn gc_delete_sent_notifications(&self, cutoff: time::OffsetDateTime) -> u64 {
+        self.repo
+            .gc_delete_sent_notifications(cutoff)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Delete `webhook_events` rows received before `cutoff`.
+    pub async fn gc_delete_old_webhook_events(&self, cutoff: time::OffsetDateTime) -> u64 {
+        self.repo
+            .gc_delete_old_webhook_events(cutoff)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Delete `idempotency_responses` rows created before `cutoff`.
+    pub async fn gc_delete_expired_idempotency_keys(&self, cutoff: time::OffsetDateTime) -> u64 {
+        self.repo
+            .gc_delete_expired_idempotency_keys(cutoff)
+            .await
+            .unwrap_or_default()
     }
 }

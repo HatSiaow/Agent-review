@@ -38,6 +38,9 @@ struct State {
 
     work_jobs: HashMap<Uuid, WorkJob>,
     work_jobs_by_type_dedupe: HashMap<(WorkJobType, String), Uuid>,
+
+    /// token_hash -> (id, user_id, created_at, expires_at, used_at)
+    password_reset_tokens: HashMap<String, (Uuid, Uuid, OffsetDateTime, OffsetDateTime, Option<OffsetDateTime>)>,
 }
 
 impl InMemoryRepository {
@@ -910,6 +913,75 @@ impl Repository for InMemoryRepository {
         job.updated_at = now;
         Ok(())
     }
+
+    async fn create_password_reset_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Uuid> {
+        let id = Uuid::new_v4();
+        let mut state = self.0.lock().await;
+        state
+            .password_reset_tokens
+            .entry(token_hash.to_string())
+            .or_insert((id, user_id, now, expires_at, None));
+        Ok(id)
+    }
+
+    async fn consume_password_reset_token(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<Uuid>> {
+        let mut state = self.0.lock().await;
+        let Some(entry) = state.password_reset_tokens.get_mut(token_hash) else {
+            return Ok(None);
+        };
+        let (_, user_id, _, expires_at, used_at) = entry;
+        if *expires_at <= now || used_at.is_some() {
+            return Ok(None);
+        }
+        let uid = *user_id;
+        *used_at = Some(now);
+        Ok(Some(uid))
+    }
+
+    async fn update_user_password_hash(
+        &self,
+        user_id: Uuid,
+        new_password_hash: &str,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        if !state.users.contains_key(&user_id) {
+            return Err(RepositoryError::NotFound);
+        }
+        state
+            .users_auth
+            .entry(user_id)
+            .and_modify(|(hash, _)| *hash = new_password_hash.to_string())
+            .or_insert_with(|| (new_password_hash.to_string(), None));
+        state.audit_events.push(AuditEvent::new(
+            ActorType::User,
+            Some(user_id),
+            "user",
+            user_id,
+            EventType::PasswordReset,
+            serde_json::json!({}),
+        ));
+        Ok(())
+    }
+
+    async fn gc_delete_expired_reset_tokens(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let before = state.password_reset_tokens.len();
+        state
+            .password_reset_tokens
+            .retain(|_, (_, _, _, expires_at, used_at)| *expires_at >= cutoff && used_at.is_none());
+        let after = state.password_reset_tokens.len();
+        Ok(u64::try_from(before - after).unwrap_or(u64::MAX))
+    }
 }
 
 #[cfg(test)]
@@ -1176,6 +1248,126 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].dedupe_key, "k1");
         assert_eq!(claimed[0].state, WorkJobState::Running);
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_happy_path() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let expires_at = now + time::Duration::minutes(30);
+
+        // The seeded owner user has a known id.
+        let user_id = Uuid::from_u128(1);
+
+        let token_hash = "abc123deadbeef".to_string();
+        repo.create_password_reset_token(user_id, &token_hash, expires_at, now)
+            .await
+            .unwrap();
+
+        // Consuming before expiry should return the user_id.
+        let result = repo
+            .consume_password_reset_token(&token_hash, now + time::Duration::seconds(60))
+            .await
+            .unwrap();
+        assert_eq!(result, Some(user_id));
+
+        // Consuming a second time must return None (already used).
+        let second = repo
+            .consume_password_reset_token(&token_hash, now + time::Duration::seconds(90))
+            .await
+            .unwrap();
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_expired_returns_none() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let expires_at = now + time::Duration::minutes(30);
+        let user_id = Uuid::from_u128(1);
+
+        repo.create_password_reset_token(user_id, "tok_expired", expires_at, now)
+            .await
+            .unwrap();
+
+        // Consuming after expiry should return None.
+        let result = repo
+            .consume_password_reset_token("tok_expired", expires_at + time::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn password_reset_unknown_token_returns_none() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let result = repo
+            .consume_password_reset_token("not_a_real_token", now)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_user_password_hash_succeeds_and_writes_audit() {
+        let repo = InMemoryRepository::new();
+        let user_id = Uuid::from_u128(1);
+
+        repo.update_user_password_hash(user_id, "new_hash_value")
+            .await
+            .unwrap();
+
+        // Verify the new hash is stored.
+        let auth = repo
+            .get_user_auth_by_email("owner@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.password_hash, "new_hash_value");
+
+        // Verify audit event written.
+        let events = repo.list_audit_events("user", user_id).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == domain::EventType::PasswordReset));
+    }
+
+    #[tokio::test]
+    async fn update_user_password_hash_unknown_user_returns_not_found() {
+        let repo = InMemoryRepository::new();
+        let fake_id = Uuid::new_v4();
+        let result = repo.update_user_password_hash(fake_id, "hash").await;
+        assert!(matches!(result, Err(RepositoryError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn gc_delete_expired_reset_tokens_removes_expired() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let user_id = Uuid::from_u128(1);
+
+        // Insert an already-expired token.
+        let expires_past = now - time::Duration::minutes(1);
+        repo.create_password_reset_token(user_id, "expired_tok", expires_past, now)
+            .await
+            .unwrap();
+
+        // Insert a valid token.
+        let expires_future = now + time::Duration::minutes(30);
+        repo.create_password_reset_token(user_id, "valid_tok", expires_future, now)
+            .await
+            .unwrap();
+
+        let deleted = repo.gc_delete_expired_reset_tokens(now).await.unwrap();
+        assert_eq!(deleted, 1, "only the expired token should be deleted");
+
+        // The valid token should still be consumable.
+        let result = repo
+            .consume_password_reset_token("valid_tok", now + time::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert_eq!(result, Some(user_id));
     }
 
     #[tokio::test]
