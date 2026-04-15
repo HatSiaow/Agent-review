@@ -13,11 +13,19 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
       - Harden session handling: `Secure` cookies in prod, explicit expiry/rotation/revocation strategy, and ensure logout clears both session + CSRF cookies.
       - Implement password reset flow and storage (token issuance + expiry + one-time use).
       - Implement optional TOTP enrollment/verification (2FA) and recovery codes.
-      - Ensure `APP_SESSION_SECRET` is always secret-backed (not ad-hoc env strings) and rotated safely (ties into secrets backend work).
+      - Rotate session secrets safely (planned rotation strategy + multi-key verification window).
     - Code: `crates/api/src/{auth.rs,v1.rs,store.rs}`, `crates/storage/src/{repo.rs,memory.rs,pg.rs}`, `crates/server/src/main.rs`.
   - **Implement secrets backend + encryption-at-rest plumbing** (the `Secrets` trait + `EnvFileSecrets`(age) + cloud backends + envelope encryption helper) per `specs/coder/09-auth-and-secrets.md` and `specs/coder/15-security-privacy-compliance.md`.
-    - Current gaps: no `Secrets` trait/implementations found in code; sensitive columns (e.g. `users.totp_secret`) are plaintext; adapters/LLM client read raw strings from env/config.
-    - Code: new crate/module (likely `crates/common` or a new `crates/secrets` + `crates/encryption`), plus storage migrations updates.
+    - Resolved (v0.1):
+      - `Secrets` backend crate exists with implementations for env + env-file; server loads secrets through `Secrets` (no longer hard-wired to ad-hoc env reads).
+      - Encryption helper crate exists for sealing/opening small secrets (session secret + provider/LLM secrets).
+      - Server/API now load `APP_SESSION_SECRET` and platform/LLM secrets from `Secrets` and pass them through to the relevant components at startup.
+    - Remaining / follow-ups (still important):
+      - **DB column encryption-at-rest is still pending**: migrate sensitive columns (e.g. `users.totp_secret`, provider refresh tokens, webhook secrets) to encrypted blobs + add read/write helpers.
+      - Add cloud secrets backends (AWS/GCP) and production-grade caching/refresh behavior.
+      - Key management story: root key storage, rotation, and envelope metadata/versioning.
+      - Expand readiness checks to verify secrets backend health/permissions in production-like deployments (not just “values exist”).
+    - Code: `crates/secrets`, `crates/encryption`, plus wiring in `crates/server/src/main.rs`, `crates/api/src/store.rs`, and secret consumers (LLM/adapters).
   - **Posting must be gated on explicit human approval, with correct state transitions and auditing** per `specs/coder/06-human-in-the-loop-workflow.md`.
     - Add missing transitions/guards in `domain` FSMs and enforce server-side (not just UI).
     - Code: `crates/domain/src/{fsm.rs,review_fsm.rs,audit.rs}`, `crates/api/src/v1.rs`, `crates/poster/src/lib.rs`, `crates/server/src/main.rs`.
@@ -101,7 +109,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/common/src/lib.rs`, all binaries’ `main.rs`.
   - **Metrics emission for core flows** (ingestion/agent/posting/notifications/http/db) per `specs/coder/12-observability.md`.
   - **Readiness checks** (DB + secrets reachable) per `specs/coder/12-observability.md` and `specs/coder/11-api-design.md`.
-    - Current: `/readyz` now does repository ping and returns `503` `application/problem+json` on failure; secrets reachability still pending until a secrets backend exists.
+    - Current: `/readyz` now does repository ping and returns `503` `application/problem+json` on failure; secrets backend exists, but health/permission checks for production backends remain to be hardened.
     - Remaining gap: server currently constructs `Store::new()` (in-memory repo) unconditionally, so `/readyz` only truly checks DB connectivity once the server is wired to `PgRepository` when `DATABASE_URL` is configured.
     - Pointers: `crates/server/src/main.rs`, `crates/api/src/store.rs`.
     - Code: `crates/api/src/v1.rs`, `crates/api/src/problem.rs`, `crates/storage/src/repo.rs`.
@@ -164,3 +172,5 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/server/src/main.rs` (`sla_worker`)
   - **Login rate limiting (JSON API + HTML login)**: shared per-email attempt window/backoff for credential stuffing mitigation on `POST /api/v1/auth/login` and web login POST.
     - Code: `crates/api/src/login_rate_limit.rs`, `crates/api/src/{v1.rs,web_ui.rs,lib.rs}`
+  - **Secrets backend + encryption helpers + server wiring**: added `Secrets` backend crate and encryption helper crate; server loads `APP_SESSION_SECRET` and platform/LLM secrets through `Secrets`.
+    - Code: `crates/secrets`, `crates/encryption`, `crates/server/src/main.rs`, `crates/api/src/store.rs`
