@@ -1,12 +1,59 @@
 use adapter_google::GoogleReviewClient as _;
 use adapter_ubereats::UberEatsReviewClient as _;
 use anyhow::Context as _;
+use clap::Parser;
 use secrecy::ExposeSecret as _;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Parser)]
+#[command(name = "server", about = "Neighbourhood Restaurant Review Agent server")]
+struct ServerArgs {
+    /// Comma-separated list of roles to run.
+    /// Options: api,ingestion,agent,poster,notifier,sla,gc
+    /// Default: all roles
+    #[arg(long, default_value = "api,ingestion,agent,poster,notifier,sla,gc")]
+    roles: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ServerRole {
+    Api,
+    Ingestion,
+    Agent,
+    Poster,
+    Notifier,
+    Sla,
+    Gc,
+}
+
+impl ServerRole {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "api" => Some(Self::Api),
+            "ingestion" => Some(Self::Ingestion),
+            "agent" => Some(Self::Agent),
+            "poster" => Some(Self::Poster),
+            "notifier" => Some(Self::Notifier),
+            "sla" => Some(Self::Sla),
+            "gc" => Some(Self::Gc),
+            other => {
+                tracing::warn!("unknown server role ignored: {other}");
+                None
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     common::init_tracing().context("init tracing")?;
+
+    let args = ServerArgs::parse();
+    let roles: std::collections::HashSet<ServerRole> = args
+        .roles
+        .split(',')
+        .filter_map(ServerRole::from_str)
+        .collect();
 
     let bind_addr = std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
 
@@ -43,38 +90,84 @@ async fn main() -> anyhow::Result<()> {
             ubereats_webhook_secret,
         )
     };
-    let app = api::router(store.clone());
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("bind {bind_addr}"))?;
-
-    tracing::info!("listening on {}", listener.local_addr()?);
 
     let cancel = CancellationToken::new();
+
+    // Respond to both SIGINT (Ctrl-C) and SIGTERM (e.g. `kill` / Kubernetes pod eviction).
     let cancel2 = cancel.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown signal received");
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                tracing::info!("SIGINT received, shutting down");
+            }
+            _ = terminate => {
+                tracing::info!("SIGTERM received, shutting down");
+            }
+        }
         cancel2.cancel();
     });
 
-    // Background workers (in-process) — minimal wiring for v0.1.
-    spawn_workers(store.clone(), cancel.clone());
+    // Background workers (in-process) — only roles explicitly enabled.
+    spawn_workers(store.clone(), cancel.clone(), &roles);
 
-    let server =
-        axum::serve(listener, app).with_graceful_shutdown(async move { cancel.cancelled().await });
+    if roles.contains(&ServerRole::Api) {
+        let app = api::router(store.clone());
+        let listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("bind {bind_addr}"))?;
+        tracing::info!("listening on {}", listener.local_addr()?);
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { cancel.cancelled().await })
+            .await
+            .context("serve")?;
+    } else {
+        tracing::info!("api role not active; running background workers only");
+        cancel.cancelled().await;
+    }
 
-    server.await.context("serve")?;
     Ok(())
 }
 
-fn spawn_workers(store: api::Store, cancel: CancellationToken) {
-    tokio::spawn(ingestion_worker(store.clone(), cancel.clone()));
-    tokio::spawn(agent_worker(store.clone(), cancel.clone()));
-    tokio::spawn(poster_worker(store.clone(), cancel.clone()));
-    tokio::spawn(sla_worker(store.clone(), cancel.clone()));
-    tokio::spawn(notifier_worker(store, cancel));
+fn spawn_workers(
+    store: api::Store,
+    cancel: CancellationToken,
+    roles: &std::collections::HashSet<ServerRole>,
+) {
+    if roles.contains(&ServerRole::Ingestion) {
+        tokio::spawn(ingestion_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Agent) {
+        tokio::spawn(agent_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Poster) {
+        tokio::spawn(poster_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Sla) {
+        tokio::spawn(sla_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Notifier) {
+        tokio::spawn(notifier_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Gc) {
+        tokio::spawn(gc_worker(store, cancel));
+    }
 }
 
 fn should_process_google_review(
@@ -718,6 +811,55 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
                                 .await;
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+async fn gc_worker(store: api::Store, cancel: CancellationToken) {
+    // Run GC once per hour.
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3_600));
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::info!("gc worker stopped");
+                return;
+            }
+            _ = tick.tick() => {
+                let now = time::OffsetDateTime::now_utc();
+
+                let raw_payload_cutoff = now - time::Duration::days(90);
+                let agent_runs_cutoff = now - time::Duration::days(180);
+                let outbox_cutoff = now - time::Duration::days(30);
+                let webhook_cutoff = now - time::Duration::hours(24);
+                let idempotency_cutoff = now - time::Duration::hours(24);
+
+                let redacted = store.gc_redact_raw_payloads(raw_payload_cutoff).await;
+                if redacted > 0 {
+                    tracing::info!(count = redacted, "gc: redacted raw_payload on old reviews");
+                }
+
+                let deleted_runs = store.gc_delete_agent_runs(agent_runs_cutoff).await;
+                if deleted_runs > 0 {
+                    tracing::info!(count = deleted_runs, "gc: deleted old agent_runs");
+                }
+
+                let deleted_notifs = store.gc_delete_sent_notifications(outbox_cutoff).await;
+                if deleted_notifs > 0 {
+                    tracing::info!(count = deleted_notifs, "gc: deleted old sent notifications");
+                }
+
+                let deleted_webhooks = store.gc_delete_old_webhook_events(webhook_cutoff).await;
+                if deleted_webhooks > 0 {
+                    tracing::info!(count = deleted_webhooks, "gc: deleted old webhook_events");
+                }
+
+                let deleted_idempotency =
+                    store.gc_delete_expired_idempotency_keys(idempotency_cutoff).await;
+                if deleted_idempotency > 0 {
+                    tracing::info!(count = deleted_idempotency, "gc: deleted expired idempotency keys");
                 }
             }
         }

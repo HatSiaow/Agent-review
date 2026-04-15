@@ -44,7 +44,26 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("migrations complete");
                 }
                 MigrateCommand::Status => {
-                    tracing::info!("migrations status is not implemented yet");
+                    let statuses = repo
+                        .migration_status()
+                        .await
+                        .context("query migration status")?;
+
+                    println!("Migration status:");
+                    println!("{:<10} {:<50} {}", "Version", "Description", "Status");
+                    println!("{}", "-".repeat(72));
+                    for s in &statuses {
+                        let label = if s.applied { "Applied" } else { "Pending" };
+                        println!("{:<10} {:<50} {}", s.version, s.description, label);
+                    }
+
+                    let all_applied = statuses.iter().all(|s| s.applied);
+                    if all_applied {
+                        println!("\nAll migrations are up to date.");
+                    } else {
+                        println!("\nSome migrations are pending. Run 'migrate up' to apply them.");
+                        std::process::exit(1);
+                    }
                 }
             }
         }

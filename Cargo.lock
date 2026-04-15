@@ -3458,6 +3458,7 @@ dependencies = [
  "anyhow",
  "api",
  "axum",
+ "clap",
  "common",
  "domain",
  "llm-client",

@@ -40,6 +40,17 @@ pub struct PgRepository {
     pool: PgPool,
 }
 
+/// Status of a single embedded migration.
+#[derive(Debug)]
+pub struct MigrationStatus {
+    /// Numeric version extracted from the migration filename (e.g. `0001` → `1`).
+    pub version: i64,
+    /// Human-readable description from the migration filename.
+    pub description: String,
+    /// Whether the migration has been successfully applied to the database.
+    pub applied: bool,
+}
+
 impl PgRepository {
     pub async fn connect(config: &PgRepositoryConfig) -> Result<Self, sqlx::Error> {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -62,6 +73,44 @@ impl PgRepository {
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         // Embeds `crates/storage/migrations/*.sql` into the binary at compile time.
         sqlx::migrate!("./migrations").run(&self.pool).await
+    }
+
+    /// Returns the status of every embedded migration: whether it has been applied or is pending.
+    ///
+    /// If the `_sqlx_migrations` table does not yet exist (fresh database), all migrations are
+    /// reported as pending.
+    pub async fn migration_status(&self) -> Result<Vec<MigrationStatus>, sqlx::Error> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            version: i64,
+            success: bool,
+        }
+
+        let applied_rows: Vec<Row> = sqlx::query_as(
+            "select version, success from _sqlx_migrations order by version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let applied_set: std::collections::HashSet<i64> = applied_rows
+            .iter()
+            .filter(|r| r.success)
+            .map(|r| r.version)
+            .collect();
+
+        let migrator = sqlx::migrate!("./migrations");
+        let statuses = migrator
+            .migrations
+            .iter()
+            .map(|m| MigrationStatus {
+                version: m.version,
+                description: m.description.to_string(),
+                applied: applied_set.contains(&m.version),
+            })
+            .collect();
+
+        Ok(statuses)
     }
 }
 
@@ -1851,6 +1900,64 @@ impl Repository for PgRepository {
         .await
         .map_err(|e| RepositoryError::Storage(e.to_string()))?
         .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_redact_raw_payloads(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            "update reviews set raw_payload = '{}'::jsonb \
+             where ingested_at < $1 and raw_payload <> '{}'::jsonb",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_agent_runs(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query("delete from agent_runs where created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_sent_notifications(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            "delete from notifications_outbox where sent_at is not null and sent_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_old_webhook_events(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query("delete from webhook_events where received_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_expired_idempotency_keys(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let rows = sqlx::query("delete from idempotency_responses where created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
         Ok(rows)
     }
 }

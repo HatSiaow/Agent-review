@@ -2,6 +2,9 @@
 //!
 //! Provides a trait for LLM inference and an in-memory fake for testing.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use thiserror::Error;
@@ -219,10 +222,38 @@ impl Default for LlmConfig {
     }
 }
 
+/// Cost in microdollars (1 USD = 1,000,000 µUSD) for an LLM response.
+///
+/// Uses hardcoded Anthropic pricing tiers:
+/// - claude-opus-*: $15/$75 per 1M input/output tokens
+/// - all others (sonnet, etc.): $3/$15 per 1M input/output tokens
+fn compute_cost_microdollars(model: &str, input_tokens: u32, output_tokens: u32) -> u64 {
+    let (input_rate, output_rate) = if model.contains("opus") {
+        (15_000_u64, 75_000_u64)
+    } else {
+        (3_000_u64, 15_000_u64)
+    };
+    let input_cost = (u64::from(input_tokens) * input_rate) / 1_000_000;
+    let output_cost = (u64::from(output_tokens) * output_rate) / 1_000_000;
+    input_cost + output_cost
+}
+
+/// Returns the current month as `YYYYMM` (e.g. `202604` for April 2026).
+fn compute_current_month() -> u32 {
+    let now = time::OffsetDateTime::now_utc();
+    let year = u32::try_from(now.year()).unwrap_or(0);
+    let month = u32::from(u8::from(now.month()));
+    year * 100 + month
+}
+
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
     http: reqwest::Client,
     config: LlmConfig,
+    /// Accumulated cost this month in microdollars (µUSD). Reset when the calendar month changes.
+    accumulated_cost_microdollars: Arc<AtomicU64>,
+    /// The month (YYYYMM) the accumulator was last reset for.
+    cost_month: Arc<std::sync::Mutex<u32>>,
 }
 
 impl AnthropicClient {
@@ -231,7 +262,16 @@ impl AnthropicClient {
         Self {
             http: reqwest::Client::new(),
             config,
+            accumulated_cost_microdollars: Arc::new(AtomicU64::new(0)),
+            cost_month: Arc::new(std::sync::Mutex::new(compute_current_month())),
         }
+    }
+
+    /// Returns the accumulated LLM spend this month in USD.
+    #[must_use]
+    pub fn current_cost_usd(&self) -> f64 {
+        let microdollars = self.accumulated_cost_microdollars.load(Ordering::Relaxed);
+        microdollars as f64 / 1_000_000.0
     }
 
     fn model_for_tier(&self, tier: ModelTier) -> &str {
@@ -337,6 +377,13 @@ impl LlmClient for AnthropicClient {
         let history_bytes = serde_json::to_vec(&history).unwrap_or_default();
         let prompt_fingerprint = sha256_hex(&history_bytes);
 
+        // Pre-flight cost cap check.
+        let cap_microdollars = (self.config.monthly_cost_cap_usd * 1_000_000.0) as u64;
+        let current = self.accumulated_cost_microdollars.load(Ordering::Relaxed);
+        if current >= cap_microdollars {
+            return Err(LlmError::CostCapExceeded);
+        }
+
         let url = format!("{}/v1/messages", self.config.api_base_url.trim_end_matches('/'));
 
         let tools_value = if request.tools.is_empty() {
@@ -433,13 +480,28 @@ impl LlmClient for AnthropicClient {
                 }
             }
 
+            let input_tokens = parsed.usage.as_ref().map_or(0, |u| u.input_tokens);
+            let output_tokens = parsed.usage.as_ref().map_or(0, |u| u.output_tokens);
+
+            // Accumulate cost; reset if the calendar month has rolled over.
+            let cost = compute_cost_microdollars(&parsed.model, input_tokens, output_tokens);
+            let current_month = compute_current_month();
+            {
+                let mut month = self.cost_month.lock().unwrap();
+                if *month != current_month {
+                    *month = current_month;
+                    self.accumulated_cost_microdollars.store(0, Ordering::Relaxed);
+                }
+            }
+            self.accumulated_cost_microdollars.fetch_add(cost, Ordering::Relaxed);
+
             let latency_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
             return Ok(GenerateResponse {
                 reply_text,
                 model_name: parsed.model,
                 prompt_fingerprint,
-                prompt_tokens: parsed.usage.as_ref().map_or(0, |u| u.input_tokens),
-                completion_tokens: parsed.usage.as_ref().map_or(0, |u| u.output_tokens),
+                prompt_tokens: input_tokens,
+                completion_tokens: output_tokens,
                 latency_ms,
                 content_blocks,
                 tool_calls,
@@ -626,5 +688,76 @@ mod tests {
         let json = serde_json::to_string(&blocks).unwrap();
         let decoded: Vec<ContentBlock> = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.len(), 3);
+    }
+
+    #[test]
+    fn compute_cost_microdollars_sonnet() {
+        // 1M input + 1M output at $3/$15 per 1M = $18 = 18_000_000 µUSD
+        let cost = compute_cost_microdollars("claude-sonnet-4-6", 1_000_000, 1_000_000);
+        assert_eq!(cost, 18_000_000);
+    }
+
+    #[test]
+    fn compute_cost_microdollars_opus() {
+        // 1M input + 1M output at $15/$75 per 1M = $90 = 90_000_000 µUSD
+        let cost = compute_cost_microdollars("claude-opus-4-6", 1_000_000, 1_000_000);
+        assert_eq!(cost, 90_000_000);
+    }
+
+    #[test]
+    fn compute_cost_microdollars_small_tokens() {
+        // input: 1000 * 3000 / 1_000_000 = 3 µUSD
+        // output: 500 * 15_000 / 1_000_000 = 7 µUSD (integer division)
+        let cost = compute_cost_microdollars("claude-sonnet-4-6", 1_000, 500);
+        assert_eq!(cost, 10);
+    }
+
+    #[tokio::test]
+    async fn anthropic_client_rejects_when_cap_exceeded() {
+        use std::sync::atomic::Ordering;
+        let config = LlmConfig {
+            monthly_cost_cap_usd: 0.000_001, // 1 µUSD cap
+            api_key: Some("dummy".into()),
+            ..LlmConfig::default()
+        };
+        let client = AnthropicClient::new(config);
+        // Push accumulated cost over the cap.
+        client.accumulated_cost_microdollars.store(2, Ordering::Relaxed);
+
+        let req = GenerateRequest {
+            review_text: Some("Nice".into()),
+            review_rating: 5,
+            review_language: Some("en".into()),
+            platform: Platform::Google,
+            restaurant_name: "Test".into(),
+            restaurant_context: String::new(),
+            model_tier: ModelTier::Standard,
+            max_chars: 500,
+            hint: None,
+            tools: Vec::new(),
+        };
+        let err = client.generate(req).await.unwrap_err();
+        assert!(matches!(err, LlmError::CostCapExceeded));
+    }
+
+    #[test]
+    fn anthropic_client_current_cost_usd_reflects_accumulator() {
+        use std::sync::atomic::Ordering;
+        let config = LlmConfig::default();
+        let client = AnthropicClient::new(config);
+        assert_eq!(client.current_cost_usd(), 0.0);
+        client
+            .accumulated_cost_microdollars
+            .store(5_000_000, Ordering::Relaxed);
+        assert!((client.current_cost_usd() - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_current_month_returns_valid_yyyymm() {
+        let month = compute_current_month();
+        assert!(month >= 202_600, "expected month >= 202600, got {month}");
+        assert_eq!(month % 100, month % 100, "month component check");
+        let month_component = month % 100;
+        assert!((1..=12).contains(&month_component), "month must be 1-12");
     }
 }

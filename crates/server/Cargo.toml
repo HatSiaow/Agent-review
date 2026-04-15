@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
 api = { path = "../api" }
 agent = { path = "../agent" }
 adapter-google = { path = "../adapters/google" }
