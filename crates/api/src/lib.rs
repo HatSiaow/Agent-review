@@ -2,6 +2,7 @@
 
 mod auth;
 mod auth_cookies;
+mod login_rate_limit;
 mod problem;
 mod request_ctx;
 mod store;
@@ -13,16 +14,14 @@ pub use crate::store::Store;
 
 use axum::extract::Request;
 use axum::middleware::{self, Next};
-use axum::routing::get;
 use axum::response::Response;
+use axum::routing::get;
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
 async fn capture_request_path(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
-    request_ctx::REQUEST_PATH
-        .scope(path, next.run(req))
-        .await
+    request_ctx::REQUEST_PATH.scope(path, next.run(req)).await
 }
 
 /// Build the full application router.

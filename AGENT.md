@@ -51,10 +51,12 @@ export DATABASE_URL="postgres://..."
 cargo run -p cli -- migrate up
 ```
 
-### Tests (fast loop)
+### Tests (targeted loop)
+
+For API, persistence, and the combined server process without running the entire workspace:
 
 ```bash
-cargo test -p domain -p storage -p api
+cargo test -p api -p storage -p server
 ```
 
 ### Tests (full workspace)
@@ -62,4 +64,8 @@ cargo test -p domain -p storage -p api
 ```bash
 cargo test
 ```
+
+### Formatting and commit scope
+
+`cargo fmt` (and some fix-oriented tooling) can rewrite many files across crates. Run formatting when you intend to, or stage only the files that belong to your change, so commits stay focused on the work at hand.
 

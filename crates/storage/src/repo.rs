@@ -1,6 +1,6 @@
 use domain::ReplyDraft;
-use domain::Review;
 use domain::RestaurantSettings;
+use domain::Review;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -90,8 +90,11 @@ pub trait Repository: Send + Sync + 'static {
     async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)>;
 
     async fn ingest_review(&self, review: Review) -> RepositoryResult<()>;
-    async fn upsert_review_with_draft(&self, review: Review, draft: ReplyDraft)
-        -> RepositoryResult<()>;
+    async fn upsert_review_with_draft(
+        &self,
+        review: Review,
+        draft: ReplyDraft,
+    ) -> RepositoryResult<()>;
 
     /// Get the last-seen update watermark for a platform sync.
     ///
@@ -152,8 +155,10 @@ pub trait Repository: Send + Sync + 'static {
 
     async fn list_drafts(&self) -> RepositoryResult<Vec<ReplyDraft>>;
 
-    async fn list_drafts_filtered(&self, query: DraftListQuery)
-        -> RepositoryResult<Vec<ReplyDraft>>;
+    async fn list_drafts_filtered(
+        &self,
+        query: DraftListQuery,
+    ) -> RepositoryResult<Vec<ReplyDraft>>;
     async fn store_agent_draft(&self, draft: ReplyDraft) -> RepositoryResult<()>;
 
     /// Persist a trace record for a single agent run.
@@ -220,10 +225,7 @@ pub trait Repository: Send + Sync + 'static {
     async fn put_restaurant_settings(&self, settings: RestaurantSettings) -> RepositoryResult<()>;
 
     /// Create a new server-side session.
-    async fn create_session(
-        &self,
-        session: domain::Session,
-    ) -> RepositoryResult<()>;
+    async fn create_session(&self, session: domain::Session) -> RepositoryResult<()>;
 
     /// Lookup a session and its user if still valid at `now`.
     async fn get_session_user(
@@ -284,4 +286,3 @@ pub struct NotificationOutboxItem {
     pub draft_id: Option<Uuid>,
     pub payload_json: serde_json::Value,
 }
-

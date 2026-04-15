@@ -13,7 +13,9 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::auth_cookies::{login_set_cookie_headers, logout_clear_cookie_headers, sign_session_cookie};
+use crate::auth_cookies::{
+    login_set_cookie_headers, logout_clear_cookie_headers, sign_session_cookie,
+};
 use crate::problem::ApiError;
 use crate::Store;
 
@@ -148,7 +150,9 @@ async fn session_user(store: &Store, headers: &HeaderMap) -> Option<domain::User
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let session_val = parse_cookie(cookie, "session")?;
-    let sid = session_val.split_once('.').and_then(|(s, _)| Uuid::parse_str(s).ok())?;
+    let sid = session_val
+        .split_once('.')
+        .and_then(|(s, _)| Uuid::parse_str(s).ok())?;
     let now = OffsetDateTime::now_utc();
     store
         .get_session_user(sid, now)
@@ -186,14 +190,11 @@ async fn page_queue(
     let tab_key = q.tab.as_deref().unwrap_or("needs");
     let queue_tab = queue_tab_from_query(q.tab.as_deref());
 
-    let platform = q
-        .platform
-        .as_deref()
-        .and_then(|s| match s {
-            "google" => Some(domain::Platform::Google),
-            "ubereats" => Some(domain::Platform::Ubereats),
-            _ => None,
-        });
+    let platform = q.platform.as_deref().and_then(|s| match s {
+        "google" => Some(domain::Platform::Google),
+        "ubereats" => Some(domain::Platform::Ubereats),
+        _ => None,
+    });
 
     let rating = q
         .rating
@@ -201,11 +202,10 @@ async fn page_queue(
         .and_then(|s: &str| s.parse::<u8>().ok())
         .filter(|r| (1..=5).contains(r));
 
-    let search = q
-        .q
-        .as_ref()
-        .map(|s: &String| s.trim().to_string())
-        .filter(|s: &String| !s.is_empty());
+    let search =
+        q.q.as_ref()
+            .map(|s: &String| s.trim().to_string())
+            .filter(|s: &String| !s.is_empty());
 
     let list_q = storage::ReviewListQuery {
         platform,
@@ -380,7 +380,10 @@ async fn page_users(State(store): State<Store>, headers: HeaderMap) -> Result<Re
     Ok(Html(page.render().map_err(|_| ApiError::ServiceUnavailable)?).into_response())
 }
 
-async fn login_form_get(State(store): State<Store>, headers: HeaderMap) -> Result<Response, ApiError> {
+async fn login_form_get(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     if session_user(&store, &headers).await.is_some() {
         return Ok(Redirect::to("/").into_response());
     }
@@ -418,6 +421,7 @@ async fn login_form_post(
     use argon2::PasswordVerifier as _;
 
     let email = form.email.trim();
+    let now = OffsetDateTime::now_utc();
     let csrf = parse_cookie(
         headers
             .get(header::COOKIE)
@@ -427,21 +431,7 @@ async fn login_form_post(
     )
     .unwrap_or_default();
 
-    let Some(auth) = store.get_user_auth_by_email(email).await? else {
-        let body = LoginPage {
-            csrf_token: csrf.clone(),
-            error: "Invalid email or password".into(),
-        }
-        .render()
-        .map_err(|_| ApiError::ServiceUnavailable)?;
-        return Ok((axum::http::StatusCode::BAD_REQUEST, Html(body)).into_response());
-    };
-
-    let parsed_hash = PasswordHash::new(&auth.password_hash).map_err(|_| ApiError::Unauthorized)?;
-    if argon2::Argon2::default()
-        .verify_password(form.password.as_bytes(), &parsed_hash)
-        .is_err()
-    {
+    if !crate::login_rate_limit::allow_attempt(email, now) {
         let body = LoginPage {
             csrf_token: csrf.clone(),
             error: "Invalid email or password".into(),
@@ -451,7 +441,45 @@ async fn login_form_post(
         return Ok((axum::http::StatusCode::BAD_REQUEST, Html(body)).into_response());
     }
 
-    let now = OffsetDateTime::now_utc();
+    let Some(auth) = store.get_user_auth_by_email(email).await? else {
+        crate::login_rate_limit::record_failure(email, now);
+        let body = LoginPage {
+            csrf_token: csrf.clone(),
+            error: "Invalid email or password".into(),
+        }
+        .render()
+        .map_err(|_| ApiError::ServiceUnavailable)?;
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Html(body)).into_response());
+    };
+
+    let parsed_hash = match PasswordHash::new(&auth.password_hash) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::login_rate_limit::record_failure(email, now);
+            let body = LoginPage {
+                csrf_token: csrf.clone(),
+                error: "Invalid email or password".into(),
+            }
+            .render()
+            .map_err(|_| ApiError::ServiceUnavailable)?;
+            return Ok((axum::http::StatusCode::BAD_REQUEST, Html(body)).into_response());
+        }
+    };
+    if argon2::Argon2::default()
+        .verify_password(form.password.as_bytes(), &parsed_hash)
+        .is_err()
+    {
+        crate::login_rate_limit::record_failure(email, now);
+        let body = LoginPage {
+            csrf_token: csrf.clone(),
+            error: "Invalid email or password".into(),
+        }
+        .render()
+        .map_err(|_| ApiError::ServiceUnavailable)?;
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Html(body)).into_response());
+    }
+
+    crate::login_rate_limit::record_success(email);
     let session = domain::Session {
         id: Uuid::new_v4(),
         user_id: auth.user.id,
