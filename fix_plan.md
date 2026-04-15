@@ -2,6 +2,15 @@
 
 Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest). File paths/specs are referenced so each item is actionable.
 
+### Newly confirmed gaps (this session)
+
+- **`mark_draft_posted` / parent review status**: updates draft state but does not transition the parent review to `replied` (pg + memory repos); wire FSM/repo so posting marks the review replied consistently.
+- **UberEats poll watermark**: ingestion worker polls without persisting/using `reviews_sync_state`, so scans can repeat work; persist/read watermark like Google polling.
+- **`notifier_worker` quiet hours**: ignores restaurant quiet-hour settings; uses hard-coded `current_hour = 12`; use real local time + persisted settings suppression.
+- **`draft_ready` outbox fan-out**: each event sends immediately; no digest batching for high-star noise reduction.
+- **SLA timers in background workers**: 2h breach, 24h escalation, and 72h auto-skip are not enforced by scheduled/worker logic.
+- **Login credential throttling**: JSON API and HTML login flows lack per-IP/account attempt limits and backoff (stuffing/bruteforce gap).
+
 - **P0 — Secure, correct human-in-the-loop posting (must-have before “real” use)**
   - **Implement real auth + sessions (owner/manager/viewer)** per `specs/coder/09-auth-and-secrets.md`, `specs/coder/06-human-in-the-loop-workflow.md`, `specs/coder/11-api-design.md`, `specs/coder/16-frontend-web-ui.md`.
     - Resolved:
