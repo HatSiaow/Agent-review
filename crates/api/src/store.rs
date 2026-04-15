@@ -236,13 +236,74 @@ impl Store {
         limit: u32,
     ) -> Vec<storage::NotificationOutboxItem> {
         self.repo
-            .claim_notification_outbox_batch(limit)
+            .claim_notification_outbox_batch(
+                limit,
+                "api-store",
+                time::OffsetDateTime::now_utc(),
+            )
             .await
             .unwrap_or_default()
     }
 
     pub async fn mark_notification_outbox_sent(&self, id: Uuid, sent_at: OffsetDateTime) {
         let _ = self.repo.mark_notification_outbox_sent(id, sent_at).await;
+    }
+
+    // --- Durable work jobs (spec 17) ---
+
+    pub async fn enqueue_work_job(
+        &self,
+        id: Uuid,
+        job_type: storage::WorkJobType,
+        dedupe_key: &str,
+        payload_json: serde_json::Value,
+        run_after: OffsetDateTime,
+        max_attempts: i32,
+        now: OffsetDateTime,
+    ) {
+        let _ = self
+            .repo
+            .enqueue_work_job(
+                id,
+                job_type,
+                dedupe_key,
+                payload_json,
+                run_after,
+                max_attempts,
+                now,
+            )
+            .await;
+    }
+
+    pub async fn claim_work_jobs(
+        &self,
+        job_type: storage::WorkJobType,
+        limit: u32,
+        locked_by: &str,
+        now: OffsetDateTime,
+    ) -> Vec<storage::WorkJob> {
+        self.repo
+            .claim_work_jobs(job_type, limit, locked_by, now)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn mark_work_job_succeeded(&self, job_id: Uuid, now: OffsetDateTime) {
+        let _ = self.repo.mark_work_job_succeeded(job_id, now).await;
+    }
+
+    pub async fn mark_work_job_failed(
+        &self,
+        job_id: Uuid,
+        error: &str,
+        next_state: storage::WorkJobState,
+        run_after: OffsetDateTime,
+        now: OffsetDateTime,
+    ) {
+        let _ = self
+            .repo
+            .mark_work_job_failed(job_id, error, next_state, run_after, now)
+            .await;
     }
 
     pub async fn get_review(&self, id: Uuid) -> Result<(Review, Option<ReplyDraft>), ApiError> {

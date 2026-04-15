@@ -68,6 +68,66 @@ pub struct UserAuth {
     pub totp_secret: Option<String>,
 }
 
+/// Durable work-job type (`specs/coder/17-work-queues-and-outbox-processing.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkJobType {
+    AgentDraftReview,
+    PosterPostReply,
+    NotifierDispatch,
+}
+
+impl WorkJobType {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentDraftReview => "agent_draft_review",
+            Self::PosterPostReply => "poster_post_reply",
+            Self::NotifierDispatch => "notifier_dispatch",
+        }
+    }
+}
+
+/// Durable work-job state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkJobState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    DeadLetter,
+}
+
+impl WorkJobState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::DeadLetter => "dead_letter",
+        }
+    }
+}
+
+/// A durable job claimed from `work_jobs`.
+#[derive(Debug, Clone)]
+pub struct WorkJob {
+    pub id: Uuid,
+    pub job_type: WorkJobType,
+    pub dedupe_key: String,
+    pub payload_json: serde_json::Value,
+    pub state: WorkJobState,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub run_after: OffsetDateTime,
+    pub locked_by: Option<String>,
+    pub locked_at: Option<OffsetDateTime>,
+    pub last_error: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
 /// Storage boundary for reviews + drafts.
 ///
 /// This abstraction lets the API and background workers operate against either
@@ -261,11 +321,14 @@ pub trait Repository: Send + Sync + 'static {
 
     /// Claim a batch of unsent outbox rows for delivery.
     ///
-    /// Implementations should ensure that concurrent workers can safely claim
-    /// distinct rows (e.g. via `FOR UPDATE SKIP LOCKED`).
+    /// Implementations must ensure that concurrent workers can safely claim
+    /// distinct rows, and that a claimed row is not returned again until it is
+    /// either marked sent or its claim expires (v0.1 uses a simple claim marker).
     async fn claim_notification_outbox_batch(
         &self,
         limit: u32,
+        claimed_by: &str,
+        now: OffsetDateTime,
     ) -> RepositoryResult<Vec<NotificationOutboxItem>>;
 
     /// Mark an outbox item as sent.
@@ -273,6 +336,45 @@ pub trait Repository: Send + Sync + 'static {
         &self,
         id: Uuid,
         sent_at: OffsetDateTime,
+    ) -> RepositoryResult<()>;
+
+    // --- Durable work jobs (spec 17) ---
+
+    /// Enqueue a durable work job, idempotent by `(job_type, dedupe_key)`.
+    async fn enqueue_work_job(
+        &self,
+        id: Uuid,
+        job_type: WorkJobType,
+        dedupe_key: &str,
+        payload_json: serde_json::Value,
+        run_after: OffsetDateTime,
+        max_attempts: i32,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<()>;
+
+    /// Claim up to `limit` pending jobs due at `now`, transitioning them to `running`.
+    async fn claim_work_jobs(
+        &self,
+        job_type: WorkJobType,
+        limit: u32,
+        locked_by: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Vec<WorkJob>>;
+
+    async fn mark_work_job_succeeded(
+        &self,
+        job_id: Uuid,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<()>;
+
+    /// Mark a job as failed (and schedule retry) or dead-letter it.
+    async fn mark_work_job_failed(
+        &self,
+        job_id: Uuid,
+        error: &str,
+        next_state: WorkJobState,
+        run_after: OffsetDateTime,
+        now: OffsetDateTime,
     ) -> RepositoryResult<()>;
 }
 

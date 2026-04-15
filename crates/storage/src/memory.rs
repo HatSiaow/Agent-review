@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::repo::{
     DraftListQuery, NotificationOutboxItem, Repository, RepositoryError, RepositoryResult,
-    ReviewListQuery,
+    ReviewListQuery, WorkJob, WorkJobState, WorkJobType,
 };
 
 #[derive(Debug, Clone)]
@@ -33,7 +33,11 @@ struct State {
     sessions: HashMap<Uuid, domain::Session>,
     notification_outbox: HashMap<Uuid, NotificationOutboxItem>,
     notification_outbox_sent_at: HashMap<Uuid, OffsetDateTime>,
+    notification_outbox_claimed: HashMap<Uuid, (String, OffsetDateTime)>,
     restaurant_settings: domain::RestaurantSettings,
+
+    work_jobs: HashMap<Uuid, WorkJob>,
+    work_jobs_by_type_dedupe: HashMap<(WorkJobType, String), Uuid>,
 }
 
 impl InMemoryRepository {
@@ -780,16 +784,25 @@ impl Repository for InMemoryRepository {
     async fn claim_notification_outbox_batch(
         &self,
         limit: u32,
+        claimed_by: &str,
+        now: OffsetDateTime,
     ) -> RepositoryResult<Vec<NotificationOutboxItem>> {
-        let state = self.0.lock().await;
+        let mut state = self.0.lock().await;
         let mut items: Vec<NotificationOutboxItem> = state
             .notification_outbox
             .values()
             .filter(|i| !state.notification_outbox_sent_at.contains_key(&i.id))
+            .filter(|i| !state.notification_outbox_claimed.contains_key(&i.id))
             .cloned()
             .collect();
-        items.sort_by_key(|i| i.occurred_at);
+        items.sort_by_key(|i| (i.occurred_at, i.id));
         items.truncate(limit as usize);
+        for i in &items {
+            state.notification_outbox_claimed.insert(
+                i.id,
+                (claimed_by.to_string(), now),
+            );
+        }
         Ok(items)
     }
 
@@ -801,7 +814,100 @@ impl Repository for InMemoryRepository {
         let mut state = self.0.lock().await;
         if state.notification_outbox.contains_key(&id) {
             state.notification_outbox_sent_at.insert(id, sent_at);
+            state.notification_outbox_claimed.remove(&id);
         }
+        Ok(())
+    }
+
+    async fn enqueue_work_job(
+        &self,
+        id: Uuid,
+        job_type: WorkJobType,
+        dedupe_key: &str,
+        payload_json: serde_json::Value,
+        run_after: OffsetDateTime,
+        max_attempts: i32,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        let key = (job_type, dedupe_key.to_string());
+        if state.work_jobs_by_type_dedupe.contains_key(&key) {
+            return Ok(());
+        }
+        let job = WorkJob {
+            id,
+            job_type,
+            dedupe_key: dedupe_key.to_string(),
+            payload_json,
+            state: WorkJobState::Pending,
+            attempts: 0,
+            max_attempts,
+            run_after,
+            locked_by: None,
+            locked_at: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.work_jobs.insert(id, job);
+        state.work_jobs_by_type_dedupe.insert(key, id);
+        Ok(())
+    }
+
+    async fn claim_work_jobs(
+        &self,
+        job_type: WorkJobType,
+        limit: u32,
+        locked_by: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Vec<WorkJob>> {
+        let mut state = self.0.lock().await;
+        let mut ids = state
+            .work_jobs
+            .values()
+            .filter(|j| j.job_type == job_type && j.state == WorkJobState::Pending && j.run_after <= now)
+            .map(|j| (j.run_after, j.id))
+            .collect::<Vec<_>>();
+        ids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut claimed = Vec::new();
+        for (_ra, id) in ids.into_iter().take(limit as usize) {
+            let Some(job) = state.work_jobs.get_mut(&id) else { continue };
+            job.state = WorkJobState::Running;
+            job.locked_by = Some(locked_by.to_string());
+            job.locked_at = Some(now);
+            job.updated_at = now;
+            claimed.push(job.clone());
+        }
+        Ok(claimed)
+    }
+
+    async fn mark_work_job_succeeded(&self, job_id: Uuid, now: OffsetDateTime) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        let Some(job) = state.work_jobs.get_mut(&job_id) else {
+            return Err(RepositoryError::NotFound);
+        };
+        job.state = WorkJobState::Succeeded;
+        job.updated_at = now;
+        Ok(())
+    }
+
+    async fn mark_work_job_failed(
+        &self,
+        job_id: Uuid,
+        error: &str,
+        next_state: WorkJobState,
+        run_after: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        let Some(job) = state.work_jobs.get_mut(&job_id) else {
+            return Err(RepositoryError::NotFound);
+        };
+        job.attempts = job.attempts.saturating_add(1);
+        job.last_error = Some(error.to_string());
+        job.state = next_state;
+        job.run_after = run_after;
+        job.updated_at = now;
         Ok(())
     }
 }
@@ -1011,14 +1117,107 @@ mod tests {
         .await
         .unwrap();
 
-        let batch = repo.claim_notification_outbox_batch(10).await.unwrap();
+        let batch = repo
+            .claim_notification_outbox_batch(10, "test", datetime!(2026-04-10 12:00:30 UTC))
+            .await
+            .unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, id);
+
+        // Claimed items should not be returned again until marked sent.
+        let dup = repo
+            .claim_notification_outbox_batch(10, "other", datetime!(2026-04-10 12:00:31 UTC))
+            .await
+            .unwrap();
+        assert!(dup.is_empty());
 
         repo.mark_notification_outbox_sent(id, datetime!(2026-04-10 12:01:00 UTC))
             .await
             .unwrap();
-        let batch2 = repo.claim_notification_outbox_batch(10).await.unwrap();
+        let batch2 = repo
+            .claim_notification_outbox_batch(10, "test", datetime!(2026-04-10 12:02:00 UTC))
+            .await
+            .unwrap();
         assert!(batch2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_jobs_enqueue_is_idempotent_by_type_and_dedupe() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-12 08:00:00 UTC);
+        repo.enqueue_work_job(
+            Uuid::new_v4(),
+            WorkJobType::AgentDraftReview,
+            "k1",
+            json!({"review_id":"r1"}),
+            now,
+            5,
+            now,
+        )
+        .await
+        .unwrap();
+        // Same type+dedupe should no-op.
+        repo.enqueue_work_job(
+            Uuid::new_v4(),
+            WorkJobType::AgentDraftReview,
+            "k1",
+            json!({"review_id":"r1b"}),
+            now,
+            5,
+            now,
+        )
+        .await
+        .unwrap();
+
+        let claimed = repo
+            .claim_work_jobs(WorkJobType::AgentDraftReview, 10, "w1", now)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].dedupe_key, "k1");
+        assert_eq!(claimed[0].state, WorkJobState::Running);
+    }
+
+    #[tokio::test]
+    async fn work_jobs_claim_respects_run_after_ordering() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-12 08:00:00 UTC);
+        let later = now + time::Duration::seconds(10);
+        repo.enqueue_work_job(
+            Uuid::new_v4(),
+            WorkJobType::PosterPostReply,
+            "a",
+            json!({"draft_id":"d1"}),
+            later,
+            5,
+            now,
+        )
+        .await
+        .unwrap();
+        repo.enqueue_work_job(
+            Uuid::new_v4(),
+            WorkJobType::PosterPostReply,
+            "b",
+            json!({"draft_id":"d2"}),
+            now,
+            5,
+            now,
+        )
+        .await
+        .unwrap();
+
+        let claimed_now = repo
+            .claim_work_jobs(WorkJobType::PosterPostReply, 10, "w1", now)
+            .await
+            .unwrap();
+        assert_eq!(claimed_now.len(), 1);
+        assert_eq!(claimed_now[0].dedupe_key, "b");
+
+        let claimed_later = repo
+            .claim_work_jobs(WorkJobType::PosterPostReply, 10, "w1", later)
+            .await
+            .unwrap();
+        assert_eq!(claimed_later.len(), 1);
+        assert_eq!(claimed_later[0].dedupe_key, "a");
     }
 }
