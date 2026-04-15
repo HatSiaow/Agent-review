@@ -1637,6 +1637,26 @@ impl Repository for PgRepository {
         Ok(())
     }
 
+    async fn release_stale_notification_claims(
+        &self,
+        claim_cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            r"
+            update notifications_outbox
+            set claimed_at = null, claimed_by = null
+            where claimed_at < $1
+              and sent_at is null
+            ",
+        )
+        .bind(claim_cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
     async fn enqueue_work_job(
         &self,
         id: Uuid,

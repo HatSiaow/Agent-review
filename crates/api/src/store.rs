@@ -286,6 +286,19 @@ impl Store {
         let _ = self.repo.mark_notification_outbox_sent(id, sent_at).await;
     }
 
+    /// Release stale notification outbox claims older than `claim_cutoff`.
+    ///
+    /// Returns the number of rows released back to claimable state.
+    pub async fn release_stale_notification_claims(
+        &self,
+        claim_cutoff: OffsetDateTime,
+    ) -> u64 {
+        self.repo
+            .release_stale_notification_claims(claim_cutoff)
+            .await
+            .unwrap_or(0)
+    }
+
     // --- Durable work jobs (spec 17) ---
 
     pub async fn enqueue_work_job(

@@ -299,6 +299,10 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
         ubereats_cfg.poll_interval_secs,
     ));
 
+    let mut google_consecutive_failures: u32 = 0;
+    let mut ubereats_consecutive_failures: u32 = 0;
+    const INGESTION_FAILURE_THRESHOLD: u32 = 3;
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -309,21 +313,57 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
                 let cfg = google_cfg.clone();
                 let store2 = store.clone();
                 let last_seen = store2.get_reviews_sync_state(domain::Platform::Google).await;
-                if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
+
+                let result = tokio::task::spawn_blocking(move || {
                     adapter_google::HttpGoogleClient::new().list_reviews(&cfg)
-                }).await {
-                    let mut max_seen: Option<time::OffsetDateTime> = last_seen;
-                    for raw in raws {
-                        if let Ok(review) = adapter_google::normalize_google_review(&raw) {
-                            if !should_process_google_review(last_seen, review.updated_at) {
-                                break; // stop-at-watermark
+                }).await;
+
+                match result {
+                    Ok(Ok(raws)) => {
+                        google_consecutive_failures = 0;
+                        let mut max_seen: Option<time::OffsetDateTime> = last_seen;
+                        for raw in raws {
+                            if let Ok(review) = adapter_google::normalize_google_review(&raw) {
+                                if !should_process_google_review(last_seen, review.updated_at) {
+                                    break; // stop-at-watermark
+                                }
+                                max_seen = Some(max_seen.map_or(review.updated_at, |m| m.max(review.updated_at)));
+                                store2.ingest_review(review).await;
                             }
-                            max_seen = Some(max_seen.map_or(review.updated_at, |m| m.max(review.updated_at)));
-                            store2.ingest_review(review).await;
+                        }
+                        if let Some(max_seen) = max_seen {
+                            store2.set_reviews_sync_state(domain::Platform::Google, max_seen).await;
                         }
                     }
-                    if let Some(max_seen) = max_seen {
-                        store2.set_reviews_sync_state(domain::Platform::Google, max_seen).await;
+                    Ok(Err(e)) => {
+                        google_consecutive_failures += 1;
+                        tracing::warn!(
+                            error = %e,
+                            consecutive_failures = google_consecutive_failures,
+                            "google ingestion adapter error"
+                        );
+                        if google_consecutive_failures >= INGESTION_FAILURE_THRESHOLD {
+                            let notification_id = stable_notification_id(
+                                &format!("ingestion_failure_google_{}", google_consecutive_failures),
+                                uuid::Uuid::from_u128(0),
+                            );
+                            store.enqueue_notification_outbox(
+                                notification_id,
+                                time::OffsetDateTime::now_utc(),
+                                domain::NotificationType::IngestionFailure,
+                                None,
+                                None,
+                                serde_json::json!({
+                                    "kind": "ingestion_failure",
+                                    "platform": "google",
+                                    "consecutive_failures": google_consecutive_failures,
+                                    "error": e.to_string()
+                                }),
+                            ).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "google ingestion spawn_blocking panicked");
                     }
                 }
             }
@@ -331,24 +371,60 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
                 let cfg = ubereats_cfg.clone();
                 let store2 = store.clone();
                 let last_seen = store2.get_reviews_sync_state(domain::Platform::Ubereats).await;
-                if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
+
+                let result = tokio::task::spawn_blocking(move || {
                     adapter_ubereats::HttpUberEatsClient::new().list_reviews(&cfg)
-                }).await {
-                    let mut max_seen: Option<time::OffsetDateTime> = last_seen;
-                    for raw in raws {
-                        if let Ok(review) = adapter_ubereats::normalize_ubereats_review(&raw) {
-                            if !should_process_ubereats_review(last_seen, &review) {
-                                continue;
+                }).await;
+
+                match result {
+                    Ok(Ok(raws)) => {
+                        ubereats_consecutive_failures = 0;
+                        let mut max_seen: Option<time::OffsetDateTime> = last_seen;
+                        for raw in raws {
+                            if let Ok(review) = adapter_ubereats::normalize_ubereats_review(&raw) {
+                                if !should_process_ubereats_review(last_seen, &review) {
+                                    continue;
+                                }
+                                let cursor_time = review_cursor_time(&review);
+                                max_seen = Some(max_seen.map_or(cursor_time, |m| m.max(cursor_time)));
+                                store2.ingest_review(review).await;
                             }
-                            let cursor_time = review_cursor_time(&review);
-                            max_seen = Some(max_seen.map_or(cursor_time, |m| m.max(cursor_time)));
-                            store2.ingest_review(review).await;
+                        }
+                        if let Some(max_seen) = max_seen {
+                            store2
+                                .set_reviews_sync_state(domain::Platform::Ubereats, max_seen)
+                                .await;
                         }
                     }
-                    if let Some(max_seen) = max_seen {
-                        store2
-                            .set_reviews_sync_state(domain::Platform::Ubereats, max_seen)
-                            .await;
+                    Ok(Err(e)) => {
+                        ubereats_consecutive_failures += 1;
+                        tracing::warn!(
+                            error = %e,
+                            consecutive_failures = ubereats_consecutive_failures,
+                            "ubereats ingestion adapter error"
+                        );
+                        if ubereats_consecutive_failures >= INGESTION_FAILURE_THRESHOLD {
+                            let notification_id = stable_notification_id(
+                                &format!("ingestion_failure_ubereats_{}", ubereats_consecutive_failures),
+                                uuid::Uuid::from_u128(0),
+                            );
+                            store.enqueue_notification_outbox(
+                                notification_id,
+                                time::OffsetDateTime::now_utc(),
+                                domain::NotificationType::IngestionFailure,
+                                None,
+                                None,
+                                serde_json::json!({
+                                    "kind": "ingestion_failure",
+                                    "platform": "ubereats",
+                                    "consecutive_failures": ubereats_consecutive_failures,
+                                    "error": e.to_string()
+                                }),
+                            ).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "ubereats ingestion spawn_blocking panicked");
                     }
                 }
             }
@@ -1026,13 +1102,22 @@ async fn notifier_worker(store: api::Store, cancel: CancellationToken) {
                 return;
             }
             _ = tick.tick() => {
+                let now = time::OffsetDateTime::now_utc();
+
+                // Release stale claims (worker crash recovery) — claims older than 5 minutes.
+                let stale_cutoff = now - time::Duration::minutes(5);
+                let released = store.release_stale_notification_claims(stale_cutoff).await;
+                if released > 0 {
+                    tracing::info!(released, "released stale notification outbox claims");
+                }
+
                 let quiet_hours = store
                     .get_restaurant_settings()
                     .await
                     .ok()
                     .and_then(|s| s.notifier_quiet_hours)
                     .and_then(|raw| parse_quiet_hours(&raw));
-                let current_hour = time::OffsetDateTime::now_utc().hour();
+                let current_hour = now.hour();
 
                 let batch = store.claim_notification_outbox_batch(50).await;
                 let mut digest_ready = Vec::new();

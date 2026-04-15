@@ -375,6 +375,18 @@ pub trait Repository: Send + Sync + 'static {
         sent_at: OffsetDateTime,
     ) -> RepositoryResult<()>;
 
+    /// Release stale notification outbox claims held for longer than the lease window.
+    ///
+    /// Rows whose `claimed_at` is before `claim_cutoff` and whose `sent_at` is null
+    /// are returned to claimable state by clearing `claimed_at`/`claimed_by`.
+    /// This handles crash recovery when a worker claimed rows but never marked them sent.
+    ///
+    /// Returns the number of rows released.
+    async fn release_stale_notification_claims(
+        &self,
+        claim_cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64>;
+
     // --- Durable work jobs (spec 17) ---
 
     /// Enqueue a durable work job, idempotent by `(job_type, dedupe_key)`.

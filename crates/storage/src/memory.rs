@@ -822,6 +822,27 @@ impl Repository for InMemoryRepository {
         Ok(())
     }
 
+    async fn release_stale_notification_claims(
+        &self,
+        claim_cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let stale_ids: Vec<Uuid> = state
+            .notification_outbox_claimed
+            .iter()
+            .filter(|(id, (_, claimed_at))| {
+                *claimed_at < claim_cutoff
+                    && !state.notification_outbox_sent_at.contains_key(*id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let count = stale_ids.len() as u64;
+        for id in stale_ids {
+            state.notification_outbox_claimed.remove(&id);
+        }
+        Ok(count)
+    }
+
     async fn enqueue_work_job(
         &self,
         id: Uuid,
