@@ -48,7 +48,9 @@ fn verify_session_cookie(value: &str) -> Result<Uuid, ApiError> {
         .map_err(|_| ApiError::ServiceUnavailable)?;
     mac.update(sid.as_bytes());
     let expected = mac.finalize().into_bytes();
-    if sig.len() != expected.len() || subtle::ConstantTimeEq::ct_eq(sig.as_slice(), expected.as_slice()).unwrap_u8() != 1 {
+    if sig.len() != expected.len()
+        || subtle::ConstantTimeEq::ct_eq(sig.as_slice(), expected.as_slice()).unwrap_u8() != 1
+    {
         return Err(ApiError::Unauthorized);
     }
     Ok(sid)

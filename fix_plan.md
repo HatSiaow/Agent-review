@@ -2,15 +2,6 @@
 
 Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest). File paths/specs are referenced so each item is actionable.
 
-### Newly confirmed gaps (this session)
-
-- **`mark_draft_posted` / parent review status**: updates draft state but does not transition the parent review to `replied` (pg + memory repos); wire FSM/repo so posting marks the review replied consistently.
-- **UberEats poll watermark**: ingestion worker polls without persisting/using `reviews_sync_state`, so scans can repeat work; persist/read watermark like Google polling.
-- **`notifier_worker` quiet hours**: ignores restaurant quiet-hour settings; uses hard-coded `current_hour = 12`; use real local time + persisted settings suppression.
-- **`draft_ready` outbox fan-out**: each event sends immediately; no digest batching for high-star noise reduction.
-- **SLA timers in background workers**: 2h breach, 24h escalation, and 72h auto-skip are not enforced by scheduled/worker logic.
-- **Login credential throttling**: JSON API and HTML login flows lack per-IP/account attempt limits and backoff (stuffing/bruteforce gap).
-
 - **P0 — Secure, correct human-in-the-loop posting (must-have before “real” use)**
   - **Implement real auth + sessions (owner/manager/viewer)** per `specs/coder/09-auth-and-secrets.md`, `specs/coder/06-human-in-the-loop-workflow.md`, `specs/coder/11-api-design.md`, `specs/coder/16-frontend-web-ui.md`.
     - Resolved:
@@ -20,7 +11,6 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Remaining / follow-ups:
       - Provisioning/admin UX for real users + role assignment in Postgres (no more “seed user” assumptions outside dev/tests).
       - Harden session handling: `Secure` cookies in prod, explicit expiry/rotation/revocation strategy, and ensure logout clears both session + CSRF cookies.
-      - Add login rate limiting / lockouts (credential stuffing protection) and generic error responses.
       - Implement password reset flow and storage (token issuance + expiry + one-time use).
       - Implement optional TOTP enrollment/verification (2FA) and recovery codes.
       - Ensure `APP_SESSION_SECRET` is always secret-backed (not ad-hoc env strings) and rotated safely (ties into secrets backend work).
@@ -78,13 +68,8 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
         - `PostFailed` enqueues an outbox row when posting fails (after retries).
         - Code: `crates/server/src/main.rs` (draft-ready enqueue + post-failed enqueue).
     - Remaining gaps vs specs:
-      - Batching/digest: no hourly digest bucketing for `draft_ready` (spec wants digest for 4–5★).
-      - Quiet hours: `NOTIFIER_QUIET_HOURS` and suppression logic not wired through the worker (currently `quiet_hours: None`).
-      - SLA timers: `sla_breach` / `sla_escalation` / 72h auto-skip not implemented (requires timers + durable scheduling).
       - `work_jobs` integration: spec `17` expects `work_jobs(notifier_dispatch)` to drive dispatch and then claim outbox rows; current implementation polls outbox directly (no `work_jobs` table/job state machine yet).
       - Richer schema + idempotency store: spec `07/08` describe more fields (state/scheduled_for/channels/event_id+channel idempotency); current table is minimal (`sent_at`-based) and doesn’t yet model per-channel idempotency or scheduled delivery.
-  - **Digest batching + quiet hours** per `specs/coder/07-notification-system.md`.
-  - **SLA timers** (2h breach, 24h escalation, 72h auto-skip) per `specs/coder/06-human-in-the-loop-workflow.md`.
 - **P2 — Agent quality + traceability**
   - **Implement `agent_runs` persistence** with the spec fields (tokens, latency, tool calls JSON, guardrail verdict, error) per `specs/coder/05-ai-response-agent.md` and `specs/coder/08-data-storage.md`.
     - Current: implemented with a new migration + repo methods; schema alignment is partial (legacy columns remain). Completed for v0.1 observability.
@@ -167,3 +152,15 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/agent/src/lib.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
   - **Readiness checks wired to repository ping**: `/readyz` now pings the repo and returns `503` `application/problem+json` on failure; secrets reachability still pending until secrets backend exists.
     - Code: `crates/api/src/v1.rs`, `crates/api/src/problem.rs`, `crates/storage/src/repo.rs`
+  - **`mark_draft_posted` transitions parent review to `replied` (pg + memory)**: posting path updates review status consistently with draft posted state.
+    - Code: `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/api/src/store.rs`, `crates/server/src/main.rs`
+  - **UberEats polling uses/persists `reviews_sync_state` watermark**: poll loop reads/writes sync state like Google so work does not repeat-scan from scratch.
+    - Code: `crates/server/src/main.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/api/src/store.rs`
+  - **`notifier_worker` respects persisted quiet hours**: loads `notifier_quiet_hours` from restaurant settings, parses ranges, suppresses sends during quiet windows.
+    - Code: `crates/server/src/main.rs`, `crates/domain/src/settings.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **`draft_ready` digest batching in notifier worker**: high-star `draft_ready` outbox rows are combined into a single digest send instead of immediate per-event fan-out.
+    - Code: `crates/server/src/main.rs` (`notifier_worker`)
+  - **SLA timers in background worker**: 2h breach, 24h escalation, and 72h auto-skip enqueue/act via dedicated `sla_worker` loop.
+    - Code: `crates/server/src/main.rs` (`sla_worker`)
+  - **Login rate limiting (JSON API + HTML login)**: shared per-email attempt window/backoff for credential stuffing mitigation on `POST /api/v1/auth/login` and web login POST.
+    - Code: `crates/api/src/login_rate_limit.rs`, `crates/api/src/{v1.rs,web_ui.rs,lib.rs}`

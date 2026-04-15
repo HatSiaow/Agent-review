@@ -152,7 +152,9 @@ fn parse_review_status(s: &str) -> Result<domain::ReviewStatus, RepositoryError>
         "replied" => Ok(domain::ReviewStatus::Replied),
         "withdrawn" => Ok(domain::ReviewStatus::Withdrawn),
         "skipped" => Ok(domain::ReviewStatus::Skipped),
-        _ => Err(RepositoryError::Storage("invalid review status".to_string())),
+        _ => Err(RepositoryError::Storage(
+            "invalid review status".to_string(),
+        )),
     }
 }
 
@@ -221,7 +223,8 @@ fn review_from_row(row: ReviewRow) -> Result<Review, RepositoryError> {
             display_name: row.author_display_name,
             avatar_url,
         },
-        rating: u8::try_from(row.rating).map_err(|_| RepositoryError::Storage("bad rating".into()))?,
+        rating: u8::try_from(row.rating)
+            .map_err(|_| RepositoryError::Storage("bad rating".into()))?,
         body_text: row.body_text,
         body_language: row.body_language,
         created_at: row.created_at,
@@ -282,12 +285,8 @@ fn agent_run_from_row(row: AgentRunRow) -> Result<domain::AgentRun, RepositoryEr
         draft_id: row.draft_id,
         model_name: row.model_name,
         prompt_fingerprint: row.prompt_fingerprint,
-        prompt_tokens: row
-            .prompt_tokens
-            .and_then(|v| u32::try_from(v).ok()),
-        completion_tokens: row
-            .completion_tokens
-            .and_then(|v| u32::try_from(v).ok()),
+        prompt_tokens: row.prompt_tokens.and_then(|v| u32::try_from(v).ok()),
+        completion_tokens: row.completion_tokens.and_then(|v| u32::try_from(v).ok()),
         latency_ms: row.latency_ms.and_then(|v| u64::try_from(v).ok()),
         tool_calls_json: row.tool_calls_json,
         guardrail_verdict_json: row.guardrail_verdict_json,
@@ -640,11 +639,12 @@ impl Repository for PgRepository {
     }
 
     async fn unskip_review(&self, _review_id: Uuid) -> RepositoryResult<Review> {
-        let res = sqlx::query(r"update reviews set status = 'new' where id = $1 and status = 'skipped'")
-            .bind(_review_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        let res =
+            sqlx::query(r"update reviews set status = 'new' where id = $1 and status = 'skipped'")
+                .bind(_review_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Storage(e.to_string()))?;
         if res.rows_affected() == 0 {
             return Err(RepositoryError::InvalidTransition);
         }
@@ -662,14 +662,18 @@ impl Repository for PgRepository {
     }
 
     async fn list_drafts(&self) -> RepositoryResult<Vec<ReplyDraft>> {
-        let rows: Vec<DraftRow> = sqlx::query_as("select * from reply_drafts order by created_at desc")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        let rows: Vec<DraftRow> =
+            sqlx::query_as("select * from reply_drafts order by created_at desc")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| RepositoryError::Storage(e.to_string()))?;
         rows.into_iter().map(draft_from_row).collect()
     }
 
-    async fn list_drafts_filtered(&self, query: DraftListQuery) -> RepositoryResult<Vec<ReplyDraft>> {
+    async fn list_drafts_filtered(
+        &self,
+        query: DraftListQuery,
+    ) -> RepositoryResult<Vec<ReplyDraft>> {
         let drafts = self.list_drafts().await?;
         let reviews = self.list_reviews().await?;
         let map: HashMap<Uuid, Review> = reviews.into_iter().map(|(r, _)| (r.id, r)).collect();
@@ -711,7 +715,10 @@ impl Repository for PgRepository {
         .bind(_draft.language)
         .bind(i32::try_from(_draft.char_count).unwrap_or(i32::MAX))
         .bind(state)
-        .bind(serde_json::to_value(_draft.guardrail_warnings).unwrap_or_else(|_| serde_json::json!([])))
+        .bind(
+            serde_json::to_value(_draft.guardrail_warnings)
+                .unwrap_or_else(|_| serde_json::json!([])),
+        )
         .bind(serde_json::to_value(_draft.flags).unwrap_or_else(|_| serde_json::json!([])))
         .bind(_draft.created_at)
         .bind(_draft.reviewed_by)
@@ -745,12 +752,9 @@ impl Repository for PgRepository {
     }
 
     async fn store_agent_run(&self, run: domain::AgentRun) -> RepositoryResult<()> {
-        let prompt_tokens: Option<i32> = run
-            .prompt_tokens
-            .and_then(|v| i32::try_from(v).ok());
-        let completion_tokens: Option<i32> = run
-            .completion_tokens
-            .and_then(|v| i32::try_from(v).ok());
+        let prompt_tokens: Option<i32> = run.prompt_tokens.and_then(|v| i32::try_from(v).ok());
+        let completion_tokens: Option<i32> =
+            run.completion_tokens.and_then(|v| i32::try_from(v).ok());
         let latency_ms: Option<i32> = run.latency_ms.and_then(|v| i32::try_from(v).ok());
 
         sqlx::query(
@@ -790,7 +794,11 @@ impl Repository for PgRepository {
         .bind(run.created_at)
         .bind(run.created_at)
         .bind(0_i32)
-        .bind(if run.error.is_some() { "failed" } else { "succeeded" })
+        .bind(if run.error.is_some() {
+            "failed"
+        } else {
+            "succeeded"
+        })
         .bind(run.error)
         .execute(&self.pool)
         .await
@@ -954,7 +962,11 @@ impl Repository for PgRepository {
                 .await
                 .map_err(|e| RepositoryError::Storage(e.to_string()))?
                 .ok_or(RepositoryError::NotFound)?;
-            if !row.guardrail_warnings.as_array().is_some_and(|a| a.is_empty()) {
+            if !row
+                .guardrail_warnings
+                .as_array()
+                .is_some_and(|a| a.is_empty())
+            {
                 return Err(RepositoryError::Conflict("draft_has_guardrail_warnings"));
             }
 
@@ -1104,6 +1116,19 @@ impl Repository for PgRepository {
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
         let draft = draft_from_row(row)?;
+        sqlx::query(
+            r"
+            update reviews
+            set status = 'replied'
+            where id = $1
+              and status <> 'withdrawn'
+              and status <> 'replied'
+            ",
+        )
+        .bind(draft.review_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
         self.append_audit(domain::AuditEvent::new(
             domain::ActorType::System,
             None,
@@ -1308,9 +1333,8 @@ impl Repository for PgRepository {
     }
 
     async fn put_restaurant_settings(&self, settings: RestaurantSettings) -> RepositoryResult<()> {
-        let payload = serde_json::to_value(&settings).map_err(|e| {
-            RepositoryError::Storage(format!("serialize restaurant settings: {e}"))
-        })?;
+        let payload = serde_json::to_value(&settings)
+            .map_err(|e| RepositoryError::Storage(format!("serialize restaurant settings: {e}")))?;
         sqlx::query(
             r"
             update restaurant_settings
@@ -1532,4 +1556,3 @@ impl Repository for PgRepository {
         Ok(())
     }
 }
-

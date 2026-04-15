@@ -8,7 +8,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::ActingUser;
-use crate::auth_cookies::{login_set_cookie_headers, logout_clear_cookie_headers, sign_session_cookie};
+use crate::auth_cookies::{
+    login_set_cookie_headers, logout_clear_cookie_headers, sign_session_cookie,
+};
 use crate::problem::{ApiError, InvalidParam};
 use crate::Store;
 
@@ -91,16 +93,29 @@ async fn login(
     use argon2::PasswordVerifier as _;
 
     let email = req.email.trim();
+    let now = OffsetDateTime::now_utc();
+    if !crate::login_rate_limit::allow_attempt(email, now) {
+        return Err(ApiError::Unauthorized);
+    }
+
     let Some(auth) = store.get_user_auth_by_email(email).await? else {
+        crate::login_rate_limit::record_failure(email, now);
         return Err(ApiError::Unauthorized);
     };
 
-    let parsed_hash = PasswordHash::new(&auth.password_hash).map_err(|_| ApiError::Unauthorized)?;
+    let parsed_hash = PasswordHash::new(&auth.password_hash).map_err(|_| {
+        crate::login_rate_limit::record_failure(email, now);
+        ApiError::Unauthorized
+    })?;
     argon2::Argon2::default()
         .verify_password(req.password.as_bytes(), &parsed_hash)
-        .map_err(|_| ApiError::Unauthorized)?;
+        .map_err(|_| {
+            crate::login_rate_limit::record_failure(email, now);
+            ApiError::Unauthorized
+        })?;
 
-    let now = OffsetDateTime::now_utc();
+    crate::login_rate_limit::record_success(email);
+
     let session = domain::Session {
         id: Uuid::new_v4(),
         user_id: auth.user.id,
@@ -158,7 +173,9 @@ async fn maybe_idempotent_success<T: serde::de::DeserializeOwned>(
         return Ok(None);
     };
     if status >= 400 {
-        return Err(ApiError::BadRequest("idempotent error replay not supported"));
+        return Err(ApiError::BadRequest(
+            "idempotent error replay not supported",
+        ));
     }
     serde_json::from_value(body)
         .map(Some)
@@ -331,11 +348,10 @@ async fn list_reviews(
         Some(s) => parse_review_sort(s)?,
     };
 
-    let search = q
-        .q
-        .as_ref()
-        .map(|s: &String| s.trim().to_string())
-        .filter(|s: &String| !s.is_empty());
+    let search =
+        q.q.as_ref()
+            .map(|s: &String| s.trim().to_string())
+            .filter(|s: &String| !s.is_empty());
 
     let list_q = storage::ReviewListQuery {
         platform,
@@ -572,8 +588,7 @@ async fn approve_draft(
 ) -> Result<Json<ApproveResponse>, ApiError> {
     require_write_role(user)?;
     require_csrf(&headers)?;
-    if let Some(cached) = maybe_idempotent_success::<ApproveResponse>(&store, &headers).await?
-    {
+    if let Some(cached) = maybe_idempotent_success::<ApproveResponse>(&store, &headers).await? {
         return Ok(Json(cached));
     }
     let updated = store.approve_draft(id, user.id, req.text).await?;
@@ -625,8 +640,7 @@ async fn bulk_approve(
     if user.role != domain::UserRole::Owner {
         return Err(ApiError::Forbidden);
     }
-    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&store, &headers).await?
-    {
+    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&store, &headers).await? {
         return Ok(Json(cached));
     }
     let updated = store.bulk_approve(&req.ids, user.id).await?;
@@ -650,8 +664,7 @@ async fn undo_bulk_approve(
     if user.role != domain::UserRole::Owner {
         return Err(ApiError::Forbidden);
     }
-    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&store, &headers).await?
-    {
+    if let Some(cached) = maybe_idempotent_success::<Vec<ReplyDraft>>(&store, &headers).await? {
         return Ok(Json(cached));
     }
     let updated = store
@@ -675,7 +688,11 @@ mod tests {
 
     fn ensure_session_secret() {
         // Stable secret for tests; must be >= 32 chars.
-        std::env::set_var("APP_SESSION_SECRET", "test-test-test-test-test-test-test-test-1234");
+        std::env::set_var(
+            "APP_SESSION_SECRET",
+            "test-test-test-test-test-test-test-test-1234",
+        );
+        crate::login_rate_limit::reset_for_tests();
     }
 
     fn oneshot(app: Router, req: Request<Body>) -> http::Response<axum::body::Body> {
@@ -722,10 +739,15 @@ mod tests {
         (session, csrf)
     }
 
-    fn auth_headers(builder: http::request::Builder, session: &str, csrf: &str) -> http::request::Builder {
-        builder
-            .header("x-csrf-token", csrf)
-            .header(http::header::COOKIE, format!("session={session}; csrf_token={csrf}"))
+    fn auth_headers(
+        builder: http::request::Builder,
+        session: &str,
+        csrf: &str,
+    ) -> http::request::Builder {
+        builder.header("x-csrf-token", csrf).header(
+            http::header::COOKIE,
+            format!("session={session}; csrf_token={csrf}"),
+        )
     }
 
     fn make_review_and_draft() -> (Uuid, Review, ReplyDraft) {
@@ -751,8 +773,7 @@ mod tests {
             context_json: json!({}),
             raw_payload: json!({ "source": "fixture" }),
         };
-        let draft =
-            domain::ReplyDraft::new_pending(review_id, "Thanks!".into(), "en".into());
+        let draft = domain::ReplyDraft::new_pending(review_id, "Thanks!".into(), "en".into());
         (review_id, review, draft)
     }
 
@@ -1300,5 +1321,45 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(res2.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn login_rate_limiter_blocks_after_repeated_failures() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let email = "owner+ratelimit@example.com";
+        for _ in 0..5 {
+            let body = serde_json::to_string(&json!({
+                "email": email,
+                "password": "wrong-password"
+            }))
+            .unwrap();
+            let res = oneshot(
+                app.clone(),
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            );
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let body = serde_json::to_string(&json!({
+            "email": email,
+            "password": "password"
+        }))
+        .unwrap();
+        let blocked = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
     }
 }

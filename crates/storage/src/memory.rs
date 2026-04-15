@@ -78,9 +78,7 @@ impl Default for InMemoryRepository {
             .users_by_email
             .insert(email.to_ascii_lowercase(), seed_user_id);
         state.users.insert(seed_user_id, user);
-        state
-            .users_auth
-            .insert(seed_user_id, (password_hash, None));
+        state.users_auth.insert(seed_user_id, (password_hash, None));
         state.restaurant_settings = domain::RestaurantSettings::default();
 
         Self(Arc::new(Mutex::new(state)))
@@ -122,7 +120,11 @@ impl Repository for InMemoryRepository {
 
     async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)> {
         let state = self.0.lock().await;
-        let review = state.reviews.get(&id).cloned().ok_or(RepositoryError::NotFound)?;
+        let review = state
+            .reviews
+            .get(&id)
+            .cloned()
+            .ok_or(RepositoryError::NotFound)?;
         let active = state
             .review_to_active_draft
             .get(&id)
@@ -133,13 +135,10 @@ impl Repository for InMemoryRepository {
 
     async fn ingest_review(&self, review: Review) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
-        let existing_id = state
-            .reviews
-            .iter()
-            .find_map(|(id, r)| {
-                (r.platform == review.platform && r.source_review_id == review.source_review_id)
-                    .then_some(*id)
-            });
+        let existing_id = state.reviews.iter().find_map(|(id, r)| {
+            (r.platform == review.platform && r.source_review_id == review.source_review_id)
+                .then_some(*id)
+        });
 
         if let Some(existing_id) = existing_id {
             let Some(existing) = state.reviews.get_mut(&existing_id) else {
@@ -166,7 +165,11 @@ impl Repository for InMemoryRepository {
                     None,
                     "review",
                     existing_id,
-                    if drift { EventType::DriftDetected } else { EventType::ReviewIngested },
+                    if drift {
+                        EventType::DriftDetected
+                    } else {
+                        EventType::ReviewIngested
+                    },
                     serde_json::json!({ "updated": true }),
                 ));
             }
@@ -186,7 +189,11 @@ impl Repository for InMemoryRepository {
         Ok(())
     }
 
-    async fn upsert_review_with_draft(&self, review: Review, draft: ReplyDraft) -> RepositoryResult<()> {
+    async fn upsert_review_with_draft(
+        &self,
+        review: Review,
+        draft: ReplyDraft,
+    ) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
         state.review_to_active_draft.insert(review.id, draft.id);
         state.reviews.insert(review.id, review);
@@ -208,7 +215,9 @@ impl Repository for InMemoryRepository {
         last_seen_update_time: time::OffsetDateTime,
     ) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
-        state.reviews_sync_state.insert(platform, last_seen_update_time);
+        state
+            .reviews_sync_state
+            .insert(platform, last_seen_update_time);
         Ok(())
     }
 
@@ -340,7 +349,10 @@ impl Repository for InMemoryRepository {
         Ok(out)
     }
 
-    async fn list_drafts_filtered(&self, query: DraftListQuery) -> RepositoryResult<Vec<ReplyDraft>> {
+    async fn list_drafts_filtered(
+        &self,
+        query: DraftListQuery,
+    ) -> RepositoryResult<Vec<ReplyDraft>> {
         let drafts = self.list_drafts().await?;
         let state = self.0.lock().await;
         let pairs: Vec<(ReplyDraft, Review)> = drafts
@@ -379,7 +391,11 @@ impl Repository for InMemoryRepository {
 
     async fn list_agent_runs(&self, review_id: Uuid) -> RepositoryResult<Vec<domain::AgentRun>> {
         let state = self.0.lock().await;
-        let mut out = state.agent_runs.get(&review_id).cloned().unwrap_or_default();
+        let mut out = state
+            .agent_runs
+            .get(&review_id)
+            .cloned()
+            .unwrap_or_default();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(out)
     }
@@ -483,7 +499,10 @@ impl Repository for InMemoryRepository {
         let post_eligible_at = now + time::Duration::seconds(10);
 
         for &draft_id in draft_ids {
-            let draft = state.drafts.get(&draft_id).ok_or(RepositoryError::NotFound)?;
+            let draft = state
+                .drafts
+                .get(&draft_id)
+                .ok_or(RepositoryError::NotFound)?;
 
             if !draft.guardrail_warnings.is_empty() {
                 return Err(RepositoryError::Conflict("draft_has_guardrail_warnings"));
@@ -584,10 +603,14 @@ impl Repository for InMemoryRepository {
         let fsm = DraftFsm::new(draft.state)
             .apply(DraftEvent::MarkPosted)
             .map_err(|_| RepositoryError::InvalidTransition)?;
+        let review_id = draft.review_id;
         draft.state = fsm.state();
         draft.posted_at = Some(posted_at);
         draft.post_eligible_at = None;
         let out = draft.clone();
+        if let Some(review) = state.reviews.get_mut(&review_id) {
+            review.status = ReviewStatus::Replied;
+        }
         state.audit_events.push(AuditEvent::new(
             ActorType::System,
             None,
@@ -678,7 +701,10 @@ impl Repository for InMemoryRepository {
         Ok(state.restaurant_settings.clone())
     }
 
-    async fn put_restaurant_settings(&self, settings: domain::RestaurantSettings) -> RepositoryResult<()> {
+    async fn put_restaurant_settings(
+        &self,
+        settings: domain::RestaurantSettings,
+    ) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
         state.restaurant_settings = settings;
         Ok(())
@@ -737,14 +763,17 @@ impl Repository for InMemoryRepository {
         payload_json: serde_json::Value,
     ) -> RepositoryResult<()> {
         let mut state = self.0.lock().await;
-        state.notification_outbox.entry(id).or_insert(NotificationOutboxItem {
-            id,
-            occurred_at,
-            notification_type,
-            review_id,
-            draft_id,
-            payload_json,
-        });
+        state
+            .notification_outbox
+            .entry(id)
+            .or_insert(NotificationOutboxItem {
+                id,
+                occurred_at,
+                notification_type,
+                review_id,
+                draft_id,
+                payload_json,
+            });
         Ok(())
     }
 
@@ -856,7 +885,9 @@ mod tests {
             .is_none());
 
         let t = datetime!(2026-04-12 08:00:00 UTC);
-        repo.set_reviews_sync_state(Platform::Google, t).await.unwrap();
+        repo.set_reviews_sync_state(Platform::Google, t)
+            .await
+            .unwrap();
         assert_eq!(
             repo.get_reviews_sync_state(Platform::Google).await.unwrap(),
             Some(t)
@@ -961,6 +992,8 @@ mod tests {
         repo.mark_draft_posted(draft_id, eligible_at + time::Duration::seconds(1))
             .await
             .unwrap();
+        let (review, _) = repo.get_review(review_id).await.unwrap();
+        assert_eq!(review.status, ReviewStatus::Replied);
     }
 
     #[tokio::test]
@@ -989,4 +1022,3 @@ mod tests {
         assert!(batch2.is_empty());
     }
 }
-

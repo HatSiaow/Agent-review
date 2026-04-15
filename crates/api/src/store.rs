@@ -111,7 +111,10 @@ impl Store {
     }
 
     pub async fn ping(&self) -> Result<(), ApiError> {
-        self.repo.ping().await.map_err(|_| ApiError::ServiceUnavailable)
+        self.repo
+            .ping()
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
     }
 
     // --- Auth / sessions ---
@@ -208,7 +211,10 @@ impl Store {
     }
 
     pub async fn get_review(&self, id: Uuid) -> Result<(Review, Option<ReplyDraft>), ApiError> {
-        self.repo.get_review(id).await.map_err(|e| Self::map_err(&e))
+        self.repo
+            .get_review(id)
+            .await
+            .map_err(|e| Self::map_err(&e))
     }
 
     pub async fn upsert_review_with_draft(&self, review: Review, draft: ReplyDraft) {
@@ -223,7 +229,11 @@ impl Store {
         &self,
         platform: domain::Platform,
     ) -> Option<time::OffsetDateTime> {
-        self.repo.get_reviews_sync_state(platform).await.ok().flatten()
+        self.repo
+            .get_reviews_sync_state(platform)
+            .await
+            .ok()
+            .flatten()
     }
 
     pub async fn set_reviews_sync_state(
@@ -282,7 +292,10 @@ impl Store {
     }
 
     pub async fn list_agent_runs(&self, review_id: Uuid) -> Vec<domain::AgentRun> {
-        self.repo.list_agent_runs(review_id).await.unwrap_or_default()
+        self.repo
+            .list_agent_runs(review_id)
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn transition_review_to_drafting(&self, review_id: Uuid) -> Result<Review, ApiError> {
