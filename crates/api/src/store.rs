@@ -10,6 +10,9 @@ use crate::problem::ApiError;
 #[derive(Clone)]
 pub struct Store {
     repo: Arc<dyn storage::Repository>,
+    secrets: Arc<dyn secrets::Secrets>,
+    session_hmac_key: Arc<Vec<u8>>,
+    ubereats_webhook_secret: Arc<Option<Vec<u8>>>,
 }
 
 impl fmt::Debug for Store {
@@ -27,14 +30,46 @@ impl Default for Store {
 impl Store {
     #[must_use]
     pub fn new() -> Self {
+        let secrets: Arc<dyn secrets::Secrets> = Arc::new(secrets::InMemorySecrets::default());
+        let session_hmac_key = Arc::new(vec![0_u8; 32]);
         Self {
             repo: Arc::new(storage::InMemoryRepository::new()),
+            secrets,
+            session_hmac_key,
+            ubereats_webhook_secret: Arc::new(None),
         }
     }
 
     #[must_use]
-    pub fn from_repo(repo: Arc<dyn storage::Repository>) -> Self {
-        Self { repo }
+    pub fn from_parts(
+        repo: Arc<dyn storage::Repository>,
+        secrets: Arc<dyn secrets::Secrets>,
+        session_hmac_key: Vec<u8>,
+        ubereats_webhook_secret: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            repo,
+            secrets,
+            session_hmac_key: Arc::new(session_hmac_key),
+            ubereats_webhook_secret: Arc::new(ubereats_webhook_secret),
+        }
+    }
+
+    #[must_use]
+    pub fn session_hmac_key(&self) -> &[u8] {
+        self.session_hmac_key.as_slice()
+    }
+
+    #[must_use]
+    pub fn ubereats_webhook_secret(&self) -> Option<&[u8]> {
+        self.ubereats_webhook_secret.as_ref().as_deref()
+    }
+
+    pub async fn get_secret_string(&self, key: &str) -> Result<secrecy::SecretString, ApiError> {
+        self.secrets
+            .get(key)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
     }
 
     fn map_err(err: &storage::RepositoryError) -> ApiError {
@@ -201,13 +236,74 @@ impl Store {
         limit: u32,
     ) -> Vec<storage::NotificationOutboxItem> {
         self.repo
-            .claim_notification_outbox_batch(limit)
+            .claim_notification_outbox_batch(
+                limit,
+                "api-store",
+                time::OffsetDateTime::now_utc(),
+            )
             .await
             .unwrap_or_default()
     }
 
     pub async fn mark_notification_outbox_sent(&self, id: Uuid, sent_at: OffsetDateTime) {
         let _ = self.repo.mark_notification_outbox_sent(id, sent_at).await;
+    }
+
+    // --- Durable work jobs (spec 17) ---
+
+    pub async fn enqueue_work_job(
+        &self,
+        id: Uuid,
+        job_type: storage::WorkJobType,
+        dedupe_key: &str,
+        payload_json: serde_json::Value,
+        run_after: OffsetDateTime,
+        max_attempts: i32,
+        now: OffsetDateTime,
+    ) {
+        let _ = self
+            .repo
+            .enqueue_work_job(
+                id,
+                job_type,
+                dedupe_key,
+                payload_json,
+                run_after,
+                max_attempts,
+                now,
+            )
+            .await;
+    }
+
+    pub async fn claim_work_jobs(
+        &self,
+        job_type: storage::WorkJobType,
+        limit: u32,
+        locked_by: &str,
+        now: OffsetDateTime,
+    ) -> Vec<storage::WorkJob> {
+        self.repo
+            .claim_work_jobs(job_type, limit, locked_by, now)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn mark_work_job_succeeded(&self, job_id: Uuid, now: OffsetDateTime) {
+        let _ = self.repo.mark_work_job_succeeded(job_id, now).await;
+    }
+
+    pub async fn mark_work_job_failed(
+        &self,
+        job_id: Uuid,
+        error: &str,
+        next_state: storage::WorkJobState,
+        run_after: OffsetDateTime,
+        now: OffsetDateTime,
+    ) {
+        let _ = self
+            .repo
+            .mark_work_job_failed(job_id, error, next_state, run_after, now)
+            .await;
     }
 
     pub async fn get_review(&self, id: Uuid) -> Result<(Review, Option<ReplyDraft>), ApiError> {

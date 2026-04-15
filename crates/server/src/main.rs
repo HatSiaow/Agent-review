@@ -1,6 +1,7 @@
 use adapter_google::GoogleReviewClient as _;
 use adapter_ubereats::UberEatsReviewClient as _;
 use anyhow::Context as _;
+use secrecy::ExposeSecret as _;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -9,14 +10,38 @@ async fn main() -> anyhow::Result<()> {
 
     let bind_addr = std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
 
+    let secrets = build_secrets_backend().await.context("init secrets backend")?;
+
+    let session_hmac_key = load_required_secret_bytes(&*secrets, "app.session_secret", "APP_SESSION_SECRET")
+        .await
+        .context("load session secret")?;
+    if session_hmac_key.len() < 32 {
+        anyhow::bail!("app.session_secret/APP_SESSION_SECRET must be at least 32 bytes");
+    }
+
+    let ubereats_webhook_secret =
+        load_optional_secret_bytes(&*secrets, "ubereats.webhook_secret", "UBEREATS_WEBHOOK_SECRET")
+            .await
+            .context("load ubereats webhook secret")?;
+
     let store = if let Some(cfg) = storage::PgRepositoryConfig::from_env() {
         let repo = storage::PgRepository::connect(&cfg)
             .await
             .context("connect db")?;
         repo.migrate().await.context("migrate db")?;
-        api::Store::from_repo(std::sync::Arc::new(repo))
+        api::Store::from_parts(
+            std::sync::Arc::new(repo),
+            secrets.clone(),
+            session_hmac_key,
+            ubereats_webhook_secret,
+        )
     } else {
-        api::Store::new()
+        api::Store::from_parts(
+            std::sync::Arc::new(storage::InMemoryRepository::new()),
+            secrets.clone(),
+            session_hmac_key,
+            ubereats_webhook_secret,
+        )
     };
     let app = api::router(store.clone());
 
@@ -128,9 +153,6 @@ fn google_config_from_env() -> adapter_google::GoogleConfig {
     if let Ok(v) = std::env::var("GOOGLE_OAUTH_CLIENT_SECRET") {
         cfg.oauth_client_secret = v;
     }
-    if let Ok(v) = std::env::var("GOOGLE_OAUTH_REFRESH_TOKEN") {
-        cfg.oauth_refresh_token = v;
-    }
     cfg
 }
 
@@ -163,8 +185,19 @@ fn ubereats_config_from_env() -> adapter_ubereats::UberEatsConfig {
 }
 
 async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
-    let google_cfg = google_config_from_env();
-    let ubereats_cfg = ubereats_config_from_env();
+    let mut google_cfg = google_config_from_env();
+    let mut ubereats_cfg = ubereats_config_from_env();
+
+    if let Ok(tok) = store.get_secret_string("google.oauth_refresh_token").await {
+        google_cfg.oauth_refresh_token = tok.expose_secret().to_string();
+    } else if let Ok(v) = std::env::var("GOOGLE_OAUTH_REFRESH_TOKEN") {
+        // Back-compat only; production should use secrets backend.
+        google_cfg.oauth_refresh_token = v;
+    }
+
+    if let Ok(secret) = store.get_secret_string("ubereats.oauth_client_secret").await {
+        ubereats_cfg.oauth_client_secret = secret.expose_secret().to_string();
+    }
 
     let mut google_tick = tokio::time::interval(std::time::Duration::from_secs(
         google_cfg.poll_interval_secs,
@@ -232,9 +265,15 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
 
 async fn agent_worker(store: api::Store, cancel: CancellationToken) {
     // Prefer Anthropic if configured; otherwise use the deterministic in-memory fake.
-    let llm: Box<dyn llm_client::LlmClient> = if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+    let anthropic_key = store
+        .get_secret_string("anthropic.api_key")
+        .await
+        .ok()
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().map(secrecy::SecretString::new));
+
+    let llm: Box<dyn llm_client::LlmClient> = if let Some(key) = anthropic_key {
         Box::new(llm_client::AnthropicClient::new(llm_client::LlmConfig {
-            api_key: Some(key),
+            api_key: Some(key.expose_secret().to_string()),
             ..llm_client::LlmConfig::default()
         }))
     } else {
@@ -406,8 +445,16 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
     let poster_cfg = poster::PosterConfig::default();
 
     // Construct a real HTTP poster when env is present; otherwise no-op (tests/dev).
-    let google_cfg = google_config_from_env();
-    let ubereats_cfg = ubereats_config_from_env();
+    let mut google_cfg = google_config_from_env();
+    let mut ubereats_cfg = ubereats_config_from_env();
+    if let Ok(tok) = store.get_secret_string("google.oauth_refresh_token").await {
+        google_cfg.oauth_refresh_token = tok.expose_secret().to_string();
+    } else if let Ok(v) = std::env::var("GOOGLE_OAUTH_REFRESH_TOKEN") {
+        google_cfg.oauth_refresh_token = v;
+    }
+    if let Ok(secret) = store.get_secret_string("ubereats.oauth_client_secret").await {
+        ubereats_cfg.oauth_client_secret = secret.expose_secret().to_string();
+    }
     let http_poster = poster::HttpPlatformPoster::new(Some(google_cfg), Some(ubereats_cfg));
 
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -488,6 +535,47 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
             }
         }
     }
+}
+
+async fn build_secrets_backend() -> anyhow::Result<std::sync::Arc<dyn secrets::Secrets>> {
+    let backend = std::env::var("SECRETS_BACKEND").unwrap_or_else(|_| "memory".to_string());
+    match backend.as_str() {
+        "memory" => Ok(std::sync::Arc::new(secrets::InMemorySecrets::default())),
+        "envfile" => {
+            let path = std::env::var("APP_SECRETS_FILE").unwrap_or_else(|_| "secrets.env.age".into());
+            let identity_file = std::env::var("APP_AGE_IDENTITY_FILE")
+                .context("APP_AGE_IDENTITY_FILE is required for SECRETS_BACKEND=envfile")?;
+            Ok(std::sync::Arc::new(secrets::EnvFileSecrets::new(path, identity_file)))
+        }
+        "aws" => {
+            let prefix = std::env::var("APP_AWS_SECRETS_PREFIX").unwrap_or_else(|_| "rr-agent".into());
+            let provider = secrets::AwsSecretsManagerSecrets::new(prefix).await?;
+            Ok(std::sync::Arc::new(provider))
+        }
+        other => anyhow::bail!("unknown SECRETS_BACKEND={other} (expected memory|envfile|aws)"),
+    }
+}
+
+async fn load_required_secret_bytes(
+    secrets: &dyn secrets::Secrets,
+    key: &str,
+    fallback_env: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if let Ok(v) = secrets.get(key).await {
+        return Ok(v.expose_secret().as_bytes().to_vec());
+    }
+    Ok(std::env::var(fallback_env)?.into_bytes())
+}
+
+async fn load_optional_secret_bytes(
+    secrets: &dyn secrets::Secrets,
+    key: &str,
+    fallback_env: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if let Ok(v) = secrets.get(key).await {
+        return Ok(Some(v.expose_secret().as_bytes().to_vec()));
+    }
+    Ok(std::env::var(fallback_env).ok().map(String::into_bytes))
 }
 
 async fn sla_worker(store: api::Store, cancel: CancellationToken) {

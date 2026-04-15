@@ -24,16 +24,62 @@ cargo build
 
 ```bash
 # Starts the API and in-process workers.
-# NOTE: required for auth/session cookies (must be >= 32 chars).
+#
+# Secrets are loaded from a backend selected by SECRETS_BACKEND:
+# - memory  (default): process-local, empty on boot
+# - envfile: encrypted env file (age)
+# - aws    : AWS Secrets Manager (prefix-based)
+
+# -----------------------
+# Required secret (auth)
+# -----------------------
+# The server requires `app.session_secret` (>= 32 bytes). You can provide it via the secrets backend
+# under the key `app.session_secret`, or via env var fallback:
 export APP_SESSION_SECRET="change-me-change-me-change-me-change-me"
 
-# In-memory mode (default): no DB required.
-APP_BIND_ADDR=127.0.0.1:3000 cargo run -p server
+# -----------------------
+# Run with SECRETS_BACKEND=memory (default)
+# -----------------------
+APP_BIND_ADDR=127.0.0.1:3000 SECRETS_BACKEND=memory cargo run -p server
 
-# Postgres mode: wire storage via DATABASE_URL; migrations run on server startup.
+# -----------------------
+# Run with SECRETS_BACKEND=envfile (age-encrypted env file)
+# -----------------------
+# Required:
+# - APP_AGE_IDENTITY_FILE: path to an age identity file used for decrypting the envfile at runtime
+#
+# Optional:
+# - APP_SECRETS_FILE: path to the encrypted envfile (default: secrets.env.age)
+# - APP_AGE_RECIPIENT: required only when *writing* envfile secrets (not needed to run the server)
+export APP_AGE_IDENTITY_FILE="$HOME/.config/age/keys.txt"
+export APP_SECRETS_FILE="secrets.env.age"
+# export APP_AGE_RECIPIENT="age1..."
+APP_BIND_ADDR=127.0.0.1:3000 SECRETS_BACKEND=envfile cargo run -p server
+
+# -----------------------
+# Run with SECRETS_BACKEND=aws (AWS Secrets Manager)
+# -----------------------
+# Optional:
+# - APP_AWS_SECRETS_PREFIX: secret name prefix (default: rr-agent)
+export APP_AWS_SECRETS_PREFIX="rr-agent"
+APP_BIND_ADDR=127.0.0.1:3000 SECRETS_BACKEND=aws cargo run -p server
+
+# Postgres storage (any secrets backend):
 # export DATABASE_URL="postgres://..."
-# APP_BIND_ADDR=127.0.0.1:3000 cargo run -p server
+# APP_BIND_ADDR=127.0.0.1:3000 SECRETS_BACKEND=memory cargo run -p server
 ```
+
+### Secrets configuration
+
+The server reads secrets by **key name** from the configured backend:
+
+- **Required**
+  - `app.session_secret` (must be \(\ge 32\) bytes; env fallback: `APP_SESSION_SECRET`)
+- **Optional**
+  - `google.oauth_refresh_token`
+  - `ubereats.oauth_client_secret`
+  - `ubereats.webhook_secret` (env fallback: `UBEREATS_WEBHOOK_SECRET`)
+  - `anthropic.api_key`
 
 ### Login (dev)
 

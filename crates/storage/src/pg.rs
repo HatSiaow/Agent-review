@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::repo::{
     DraftListQuery, NotificationOutboxItem, Repository, RepositoryError, RepositoryResult,
-    ReviewListQuery,
+    ReviewListQuery, WorkJob, WorkJobState, WorkJobType,
 };
 
 /// Singleton row id for `restaurant_settings` (see migration `0005_restaurant_settings.sql`).
@@ -118,6 +118,23 @@ struct AuditEventRow {
     entity_id: Uuid,
     event_type: String,
     details_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct WorkJobRow {
+    id: Uuid,
+    job_type: String,
+    dedupe_key: String,
+    payload_json: serde_json::Value,
+    state: String,
+    attempts: i32,
+    max_attempts: i32,
+    run_after: OffsetDateTime,
+    locked_by: Option<String>,
+    locked_at: Option<OffsetDateTime>,
+    last_error: Option<String>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1488,6 +1505,8 @@ impl Repository for PgRepository {
     async fn claim_notification_outbox_batch(
         &self,
         limit: u32,
+        claimed_by: &str,
+        now: OffsetDateTime,
     ) -> RepositoryResult<Vec<NotificationOutboxItem>> {
         #[derive(Debug, Clone, sqlx::FromRow)]
         struct OutboxRow {
@@ -1501,15 +1520,26 @@ impl Repository for PgRepository {
 
         let rows: Vec<OutboxRow> = sqlx::query_as(
             r"
-            select id, occurred_at, notification_type, review_id, draft_id, payload_json
-            from notifications_outbox
-            where sent_at is null
-            order by occurred_at asc
-            for update skip locked
-            limit $1
+            with to_claim as (
+              select id
+              from notifications_outbox
+              where sent_at is null
+                and claimed_at is null
+              order by occurred_at asc, id asc
+              for update skip locked
+              limit $1
+            )
+            update notifications_outbox n
+            set claimed_at = $2,
+                claimed_by = $3
+            from to_claim
+            where n.id = to_claim.id
+            returning n.id, n.occurred_at, n.notification_type, n.review_id, n.draft_id, n.payload_json
             ",
         )
         .bind(i64::from(limit))
+        .bind(now)
+        .bind(claimed_by)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Storage(e.to_string()))?;
@@ -1547,12 +1577,189 @@ impl Repository for PgRepository {
         id: Uuid,
         sent_at: OffsetDateTime,
     ) -> RepositoryResult<()> {
-        sqlx::query("update notifications_outbox set sent_at = $1 where id = $2")
+        sqlx::query(
+            "update notifications_outbox set sent_at = $1, claimed_at = null, claimed_by = null where id = $2",
+        )
             .bind(sent_at)
             .bind(id)
             .execute(&self.pool)
             .await
             .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn enqueue_work_job(
+        &self,
+        id: Uuid,
+        job_type: WorkJobType,
+        dedupe_key: &str,
+        payload_json: serde_json::Value,
+        run_after: OffsetDateTime,
+        max_attempts: i32,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        sqlx::query(
+            r"
+            insert into work_jobs (
+              id, job_type, dedupe_key, payload_json,
+              state, attempts, max_attempts,
+              run_after, locked_by, locked_at, last_error,
+              created_at, updated_at
+            ) values (
+              $1,$2,$3,$4,
+              'pending',0,$5,
+              $6,null,null,null,
+              $7,$7
+            )
+            on conflict (job_type, dedupe_key) do nothing
+            ",
+        )
+        .bind(id)
+        .bind(job_type.as_str())
+        .bind(dedupe_key)
+        .bind(payload_json)
+        .bind(max_attempts)
+        .bind(run_after)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn claim_work_jobs(
+        &self,
+        job_type: WorkJobType,
+        limit: u32,
+        locked_by: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Vec<WorkJob>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        let rows: Vec<WorkJobRow> = sqlx::query_as(
+            r"
+            with to_claim as (
+              select id
+              from work_jobs
+              where job_type = $1
+                and state = 'pending'
+                and run_after <= $2
+              order by run_after asc, id asc
+              for update skip locked
+              limit $3
+            )
+            update work_jobs w
+            set state = 'running',
+                locked_by = $4,
+                locked_at = $2,
+                updated_at = $2
+            from to_claim
+            where w.id = to_claim.id
+            returning
+              w.id, w.job_type, w.dedupe_key, w.payload_json,
+              w.state, w.attempts, w.max_attempts, w.run_after,
+              w.locked_by, w.locked_at, w.last_error,
+              w.created_at, w.updated_at
+            ",
+        )
+        .bind(job_type.as_str())
+        .bind(now)
+        .bind(i64::from(limit))
+        .bind(locked_by)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let jt = match r.job_type.as_str() {
+                "agent_draft_review" => WorkJobType::AgentDraftReview,
+                "poster_post_reply" => WorkJobType::PosterPostReply,
+                "notifier_dispatch" => WorkJobType::NotifierDispatch,
+                _ => return Err(RepositoryError::Storage("invalid job_type".into())),
+            };
+            let st = match r.state.as_str() {
+                "pending" => WorkJobState::Pending,
+                "running" => WorkJobState::Running,
+                "succeeded" => WorkJobState::Succeeded,
+                "failed" => WorkJobState::Failed,
+                "dead_letter" => WorkJobState::DeadLetter,
+                _ => return Err(RepositoryError::Storage("invalid job state".into())),
+            };
+            out.push(WorkJob {
+                id: r.id,
+                job_type: jt,
+                dedupe_key: r.dedupe_key,
+                payload_json: r.payload_json,
+                state: st,
+                attempts: r.attempts,
+                max_attempts: r.max_attempts,
+                run_after: r.run_after,
+                locked_by: r.locked_by,
+                locked_at: r.locked_at,
+                last_error: r.last_error,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn mark_work_job_succeeded(&self, job_id: Uuid, now: OffsetDateTime) -> RepositoryResult<()> {
+        let rows = sqlx::query(
+            "update work_jobs set state = 'succeeded', updated_at = $1 where id = $2",
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn mark_work_job_failed(
+        &self,
+        job_id: Uuid,
+        error: &str,
+        next_state: WorkJobState,
+        run_after: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<()> {
+        let rows = sqlx::query(
+            r"
+            update work_jobs
+            set state = $1,
+                attempts = attempts + 1,
+                last_error = $2,
+                run_after = $3,
+                updated_at = $4
+            where id = $5
+            ",
+        )
+        .bind(next_state.as_str())
+        .bind(error)
+        .bind(run_after)
+        .bind(now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(RepositoryError::NotFound);
+        }
         Ok(())
     }
 }

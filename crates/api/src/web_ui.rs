@@ -489,7 +489,7 @@ async fn login_form_post(
     store.create_session(session.clone()).await?;
 
     let csrf_new = Uuid::new_v4().to_string();
-    let session_value = sign_session_cookie(session.id)?;
+    let session_value = sign_session_cookie(session.id, store.session_hmac_key())?;
     let headers_out = login_set_cookie_headers(&session_value, &csrf_new)?;
     Ok((headers_out, Redirect::to("/")).into_response())
 }

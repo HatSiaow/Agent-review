@@ -7,5 +7,5 @@ pub use memory::InMemoryRepository;
 pub use pg::{PgRepository, PgRepositoryConfig};
 pub use repo::{
     DraftListQuery, NotificationOutboxItem, QueueTab, Repository, RepositoryError, ReviewListQuery,
-    ReviewSort, UserAuth,
+    ReviewSort, UserAuth, WorkJob, WorkJobState, WorkJobType,
 };

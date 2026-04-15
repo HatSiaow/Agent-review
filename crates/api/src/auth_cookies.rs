@@ -6,14 +6,13 @@ use uuid::Uuid;
 
 use crate::problem::ApiError;
 
-pub fn sign_session_cookie(session_id: Uuid) -> Result<String, ApiError> {
+pub fn sign_session_cookie(session_id: Uuid, session_hmac_key: &[u8]) -> Result<String, ApiError> {
     use hmac::Mac as _;
-    let secret = std::env::var("APP_SESSION_SECRET").map_err(|_| ApiError::ServiceUnavailable)?;
-    if secret.trim().len() < 32 {
+    if session_hmac_key.len() < 32 {
         return Err(ApiError::ServiceUnavailable);
     }
-    let mut mac =
-        hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::ServiceUnavailable)?;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(session_hmac_key)
+        .map_err(|_| ApiError::ServiceUnavailable)?;
     mac.update(session_id.as_bytes());
     let sig = mac.finalize().into_bytes();
     Ok(format!("{session_id}.{}", hex::encode(sig)))
