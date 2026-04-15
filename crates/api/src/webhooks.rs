@@ -10,14 +10,6 @@ use sha2::Digest as _;
 
 use crate::Store;
 
-fn ubereats_webhook_secret() -> Option<&'static str> {
-    use std::sync::OnceLock;
-    static SECRET: OnceLock<Option<String>> = OnceLock::new();
-    SECRET
-        .get_or_init(|| std::env::var("UBEREATS_WEBHOOK_SECRET").ok())
-        .as_deref()
-}
-
 pub fn router() -> Router<Store> {
     Router::new().route("/ubereats", post(ubereats_webhook))
 }
@@ -27,13 +19,13 @@ async fn ubereats_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    if let Some(secret) = ubereats_webhook_secret() {
+    if let Some(secret) = store.ubereats_webhook_secret() {
         let signature = headers
             .get("x-uber-signature")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if verify_webhook_signature(signature, secret.as_bytes(), &body).is_err() {
+        if verify_webhook_signature(signature, secret, &body).is_err() {
             tracing::warn!("UberEats webhook signature verification failed");
             return StatusCode::UNAUTHORIZED;
         }

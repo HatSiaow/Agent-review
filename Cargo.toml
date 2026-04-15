@@ -4,6 +4,8 @@ members = [
   "crates/common",
   "crates/cli",
   "crates/domain",
+  "crates/encryption",
+  "crates/secrets",
   "crates/adapters/google",
   "crates/adapters/ubereats",
   "crates/llm_client",
@@ -55,3 +57,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+base64 = "0.22"
+secrecy = "0.8"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+rand_core = "0.6"

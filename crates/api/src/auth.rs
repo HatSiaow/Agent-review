@@ -21,14 +21,6 @@ impl FromRequestParts<Store> for ActingUser {
     }
 }
 
-fn session_secret() -> Result<Vec<u8>, ApiError> {
-    let raw = std::env::var("APP_SESSION_SECRET").map_err(|_| ApiError::ServiceUnavailable)?;
-    if raw.trim().len() < 32 {
-        return Err(ApiError::ServiceUnavailable);
-    }
-    Ok(raw.into_bytes())
-}
-
 fn parse_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     cookie_header
         .split(';')
@@ -37,14 +29,14 @@ fn parse_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn verify_session_cookie(value: &str) -> Result<Uuid, ApiError> {
+fn verify_session_cookie(value: &str, session_hmac_key: &[u8]) -> Result<Uuid, ApiError> {
     use hmac::Mac as _;
 
     let (sid, sig_hex) = value.split_once('.').ok_or(ApiError::Unauthorized)?;
     let sid = Uuid::parse_str(sid).map_err(|_| ApiError::Unauthorized)?;
     let sig = hex::decode(sig_hex).map_err(|_| ApiError::Unauthorized)?;
 
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&session_secret()?)
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(session_hmac_key)
         .map_err(|_| ApiError::ServiceUnavailable)?;
     mac.update(sid.as_bytes());
     let expected = mac.finalize().into_bytes();
@@ -65,7 +57,7 @@ async fn extract_from_cookie(parts: &Parts, store: &Store) -> Result<ActingUser,
     let Some(value) = parse_cookie_value(cookie_header, "session") else {
         return Err(ApiError::Unauthorized);
     };
-    let session_id = verify_session_cookie(&value)?;
+    let session_id = verify_session_cookie(&value, store.session_hmac_key())?;
 
     let now = OffsetDateTime::now_utc();
     let Some((_session, user)) = store.get_session_user(session_id, now).await? else {

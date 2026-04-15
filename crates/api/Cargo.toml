@@ -16,6 +16,8 @@ axum = { workspace = true, features = ["query", "form"] }
 cookie = { workspace = true }
 domain = { path = "../domain" }
 storage = { path = "../storage" }
+secrets = { path = "../secrets" }
+secrecy.workspace = true
 hex.workspace = true
 hmac.workspace = true
 http.workspace = true

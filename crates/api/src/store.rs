@@ -10,6 +10,9 @@ use crate::problem::ApiError;
 #[derive(Clone)]
 pub struct Store {
     repo: Arc<dyn storage::Repository>,
+    secrets: Arc<dyn secrets::Secrets>,
+    session_hmac_key: Arc<Vec<u8>>,
+    ubereats_webhook_secret: Arc<Option<Vec<u8>>>,
 }
 
 impl fmt::Debug for Store {
@@ -27,14 +30,46 @@ impl Default for Store {
 impl Store {
     #[must_use]
     pub fn new() -> Self {
+        let secrets: Arc<dyn secrets::Secrets> = Arc::new(secrets::InMemorySecrets::default());
+        let session_hmac_key = Arc::new(vec![0_u8; 32]);
         Self {
             repo: Arc::new(storage::InMemoryRepository::new()),
+            secrets,
+            session_hmac_key,
+            ubereats_webhook_secret: Arc::new(None),
         }
     }
 
     #[must_use]
-    pub fn from_repo(repo: Arc<dyn storage::Repository>) -> Self {
-        Self { repo }
+    pub fn from_parts(
+        repo: Arc<dyn storage::Repository>,
+        secrets: Arc<dyn secrets::Secrets>,
+        session_hmac_key: Vec<u8>,
+        ubereats_webhook_secret: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            repo,
+            secrets,
+            session_hmac_key: Arc::new(session_hmac_key),
+            ubereats_webhook_secret: Arc::new(ubereats_webhook_secret),
+        }
+    }
+
+    #[must_use]
+    pub fn session_hmac_key(&self) -> &[u8] {
+        self.session_hmac_key.as_slice()
+    }
+
+    #[must_use]
+    pub fn ubereats_webhook_secret(&self) -> Option<&[u8]> {
+        self.ubereats_webhook_secret.as_ref().as_deref()
+    }
+
+    pub async fn get_secret_string(&self, key: &str) -> Result<secrecy::SecretString, ApiError> {
+        self.secrets
+            .get(key)
+            .await
+            .map_err(|_| ApiError::ServiceUnavailable)
     }
 
     fn map_err(err: &storage::RepositoryError) -> ApiError {
