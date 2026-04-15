@@ -77,6 +77,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
         - Code: `crates/server/src/main.rs` (draft-ready enqueue + post-failed enqueue).
     - Remaining gaps vs specs:
       - `work_jobs` integration: spec `17` expects `work_jobs(notifier_dispatch)` to drive dispatch and then claim outbox rows; current implementation polls outbox directly (no `work_jobs` table/job state machine yet).
+      - Outbox claiming durability: current Postgres claiming uses `SELECT ... FOR UPDATE SKIP LOCKED` without a durable “claimed” update, so concurrent workers can still duplicate-send (e.g. after txn boundaries/retries/crashes). Fix by adding `claimed_at`/`claimed_by` (and optionally `claim_token`/lease) and performing an atomic `UPDATE ... SET claimed_* ... WHERE ... RETURNING *` claim, or drive dispatch entirely via `work_jobs` and only send for jobs that are durably claimed.
       - Richer schema + idempotency store: spec `07/08` describe more fields (state/scheduled_for/channels/event_id+channel idempotency); current table is minimal (`sent_at`-based) and doesn’t yet model per-channel idempotency or scheduled delivery.
 - **P2 — Agent quality + traceability**
   - **Implement `agent_runs` persistence** with the spec fields (tokens, latency, tool calls JSON, guardrail verdict, error) per `specs/coder/05-ai-response-agent.md` and `specs/coder/08-data-storage.md`.
