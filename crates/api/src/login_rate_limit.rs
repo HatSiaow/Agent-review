@@ -94,22 +94,26 @@ mod tests {
 
     #[test]
     fn allows_up_to_limit_then_blocks() {
-        reset_for_tests();
+        // Use a unique email per test to avoid interference with parallel test runners.
         let now = datetime!(2026-04-15 12:00:00 UTC);
-        let email = "owner@example.com";
+        let email = "rate-limit-block-test@example.com";
+        // Pre-clean any state from a prior run.
+        record_success(email);
 
         for _ in 0..5 {
             assert!(allow_attempt(email, now));
             record_failure(email, now);
         }
         assert!(!allow_attempt(email, now));
+        // Clean up so the global state doesn't affect other tests.
+        record_success(email);
     }
 
     #[test]
     fn success_clears_attempt_window() {
-        reset_for_tests();
+        // Use a unique email per test to avoid interference with parallel test runners.
         let now = datetime!(2026-04-15 12:00:00 UTC);
-        let email = "owner@example.com";
+        let email = "rate-limit-success-test@example.com";
         record_failure(email, now);
         record_success(email);
         assert!(allow_attempt(email, now));

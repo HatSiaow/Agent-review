@@ -2,16 +2,16 @@
 
 Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest). File paths/specs are referenced so each item is actionable.
 
-- **P0 — Secure, correct human-in-the-loop posting (must-have before “real” use)**
+- **P0 — Secure, correct human-in-the-loop posting (must-have before "real" use)**
   - **Implement real auth + sessions (owner/manager/viewer)** per `specs/coder/09-auth-and-secrets.md`, `specs/coder/06-human-in-the-loop-workflow.md`, `specs/coder/11-api-design.md`, `specs/coder/16-frontend-web-ui.md`.
     - Resolved:
       - Session-cookie auth is implemented (`POST /api/v1/auth/login`, `POST /api/v1/auth/logout`) and API identity now derives from the session cookie (no `x-user-id` / `x-user-role` header auth).
       - In-memory repo seeds a dev/test owner user `owner@example.com` / `password`.
       - Server wires `PgRepository` when `DATABASE_URL` is set (else falls back to in-memory).
+      - Password reset flow implemented (migration 0009, `/api/v1/auth/password-reset/request` + `/confirm`).
     - Remaining / follow-ups:
-      - Provisioning/admin UX for real users + role assignment in Postgres (no more “seed user” assumptions outside dev/tests).
+      - Provisioning/admin UX for real users + role assignment in Postgres (no more "seed user" assumptions outside dev/tests).
       - Harden session handling: `Secure` cookies in prod, explicit expiry/rotation/revocation strategy, and ensure logout clears both session + CSRF cookies.
-      - Implement password reset flow and storage (token issuance + expiry + one-time use).
       - Implement optional TOTP enrollment/verification (2FA) and recovery codes.
       - Rotate session secrets safely (planned rotation strategy + multi-key verification window).
     - Code: `crates/api/src/{auth.rs,v1.rs,store.rs}`, `crates/storage/src/{repo.rs,memory.rs,pg.rs}`, `crates/server/src/main.rs`.
@@ -24,7 +24,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
       - **DB column encryption-at-rest is still pending**: migrate sensitive columns (e.g. `users.totp_secret`, provider refresh tokens, webhook secrets) to encrypted blobs + add read/write helpers.
       - Add cloud secrets backends (AWS/GCP) and production-grade caching/refresh behavior.
       - Key management story: root key storage, rotation, and envelope metadata/versioning.
-      - Expand readiness checks to verify secrets backend health/permissions in production-like deployments (not just “values exist”).
+      - Expand readiness checks to verify secrets backend health/permissions in production-like deployments (not just "values exist").
     - Code: `crates/secrets`, `crates/encryption`, plus wiring in `crates/server/src/main.rs`, `crates/api/src/store.rs`, and secret consumers (LLM/adapters).
   - **Posting must be gated on explicit human approval, with correct state transitions and auditing** per `specs/coder/06-human-in-the-loop-workflow.md`.
     - Add missing transitions/guards in `domain` FSMs and enforce server-side (not just UI).
@@ -39,9 +39,7 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Make storage schema + repo behavior match the specs** (`model_version`, defaults, indexes, constraints, proper tables) per `specs/coder/08-data-storage.md` and `specs/coder/04-unified-review-data-model.md`.
     - Biggest mismatches: `agent_runs`, `notifications_outbox`, `reviews_sync_state`, `users` columns/constraints, missing defaults/indexes.
     - Code: `crates/storage/migrations/0001_init.sql`, `crates/storage/src/pg.rs`.
-  - **Retention / `storage_gc` job** (raw_payload redaction after 90d; agent_runs 180d; etc.) per `specs/coder/08-data-storage.md` and `specs/coder/15-security-privacy-compliance.md`.
-    - Code: new worker/binary path (likely `crates/server` role + `crates/storage` SQL helpers).
-- **P0 — Web UI (the “single inbox” is not usable without it)**
+- **P0 — Web UI (the "single inbox" is not usable without it)**
   - **Implement server-rendered UI (Askama + htmx) routes and templates** per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md`.
     - Implemented (v0.1) inside `crates/api` (no separate `web_ui` crate): Askama templates + routes for login, queue (`/`), review detail, settings, users; shared cookie helpers in `auth_cookies`.
     - Remaining vs spec: richer htmx interactions (inline approve/edit without full page flows), accessibility polish, and full card/action parity with JSON API.
@@ -51,14 +49,11 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Remaining: UI-specific constraints (card limits, bulk actions from queue page, full tab UX per spec).
     - Code: `crates/storage/src/{repo.rs,list_filters.rs,pg.rs,memory.rs}`, `crates/api/src/v1.rs`, `crates/api/src/web_ui.rs`.
 - **P1 — Reliable workflow orchestration (ingestion → agent → approve → poster)**
-  - **Replace demo “scan loops” with durable job/outbox processing** per `specs/coder/01-architecture.md`, `specs/coder/07-notification-system.md`, `specs/coder/13-deployment-infra.md` and the new `specs/coder/17-work-queues-and-outbox-processing.md`.
-    - Current `crates/server/src/main.rs` polls `list_reviews/list_drafts` every 2s and uses in-memory de-dupe; no durable queues/outbox claims.
-    - Code: `crates/server/src/main.rs`, `crates/storage`, plus new queue/outbox abstractions.
-  - **Ingestion orchestration** (Google polling with stop-at-watermark; UberEats webhook enqueues + polling fallback “since last created_at”; per-location sync state) per `specs/coder/02-google-reviews-integration.md`, `specs/coder/03-ubereats-reviews-integration.md`.
-    - Remaining: “enqueue + polling fallback” orchestration, DLQ behaviors, and per-location fanout/locking (watermark persistence is now in place).
+  - **Ingestion orchestration** (Google polling with stop-at-watermark; UberEats webhook enqueues + polling fallback "since last created_at"; per-location sync state) per `specs/coder/02-google-reviews-integration.md`, `specs/coder/03-ubereats-reviews-integration.md`.
+    - Remaining: "enqueue + polling fallback" orchestration, DLQ behaviors, and per-location fanout/locking (watermark persistence is now in place).
     - Code: `crates/ingestion/src/lib.rs`, `crates/adapters/{google,ubereats}/src/lib.rs`, `crates/api/src/webhooks.rs`, `crates/storage/src/{pg.rs,repo.rs}`.
   - **Poster worker correctness** (idempotent posting, drift detection, retries persisted, surface platform rejections) per `specs/coder/01-architecture.md` and platform specs (`02`, `03`).
-    - Current: retries exist but no durable job records; drift detection is largely missing.
+    - Poster worker now claims `poster_post_reply` work_jobs (spec 17). Remaining: drift detection and surface platform rejections.
     - Code: `crates/poster/src/lib.rs`, `crates/server/src/main.rs`, adapters + storage.
 - **P1 — Notifications (owner should actually get notified, without noise)**
   - **Implement notifier outbox pipeline with idempotency store** per `specs/coder/07-notification-system.md`.
@@ -70,15 +65,16 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
         - Code: `crates/storage/src/repo.rs`, `crates/storage/src/{pg.rs,memory.rs}`, `crates/api/src/store.rs`.
       - Server notifier worker consumes the outbox (restart-safe / durable semantics):
         - Periodically claims a batch from `notifications_outbox` and marks rows `sent_at` on successful delivery.
+        - Calls `release_stale_notification_claims()` before each batch to reset claims older than 5 minutes.
         - Code: `crates/server/src/main.rs` (`notifier_worker`).
       - Domain events enqueue outbox entries:
         - `DraftReady` enqueues an outbox row when a draft becomes ready for review.
         - `PostFailed` enqueues an outbox row when posting fails (after retries).
-        - Code: `crates/server/src/main.rs` (draft-ready enqueue + post-failed enqueue).
+        - `IngestionFailure` enqueued after 3 consecutive adapter failures.
+        - Code: `crates/server/src/main.rs` (draft-ready enqueue + post-failed enqueue + ingestion-failure enqueue).
     - Remaining gaps vs specs:
-      - `work_jobs` integration: spec `17` expects `work_jobs(notifier_dispatch)` to drive dispatch and then claim outbox rows; current implementation polls outbox directly (no `work_jobs` table/job state machine yet).
-      - Outbox claiming durability: current Postgres claiming uses `SELECT ... FOR UPDATE SKIP LOCKED` without a durable “claimed” update, so concurrent workers can still duplicate-send (e.g. after txn boundaries/retries/crashes). Fix by adding `claimed_at`/`claimed_by` (and optionally `claim_token`/lease) and performing an atomic `UPDATE ... SET claimed_* ... WHERE ... RETURNING *` claim, or drive dispatch entirely via `work_jobs` and only send for jobs that are durably claimed.
-      - Richer schema + idempotency store: spec `07/08` describe more fields (state/scheduled_for/channels/event_id+channel idempotency); current table is minimal (`sent_at`-based) and doesn’t yet model per-channel idempotency or scheduled delivery.
+      - `work_jobs` integration: spec `17` expects `work_jobs(notifier_dispatch)` to drive dispatch and then claim outbox rows; current implementation polls outbox directly (no `work_jobs` table/job state machine for notifier yet).
+      - Richer schema + idempotency store: spec `07/08` describe more fields (state/scheduled_for/channels/event_id+channel idempotency); current table is minimal (`sent_at`-based) and doesn't yet model per-channel idempotency or scheduled delivery.
 - **P2 — Agent quality + traceability**
   - **Implement `agent_runs` persistence** with the spec fields (tokens, latency, tool calls JSON, guardrail verdict, error) per `specs/coder/05-ai-response-agent.md` and `specs/coder/08-data-storage.md`.
     - Current: implemented with a new migration + repo methods; schema alignment is partial (legacy columns remain). Completed for v0.1 observability.
@@ -87,27 +83,21 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Compute and store `prompt_fingerprint`** (and version prompts) per `specs/coder/05-ai-response-agent.md`.
     - Current: computed as `sha256(prompt)` in `llm_client` and stored on `reply_drafts`.
     - Code: `crates/llm_client/src/lib.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`.
-  - **Fix `llm_client` usage accounting and cost cap enforcement** per `specs/coder/05-ai-response-agent.md` and `specs/coder/13-deployment-infra.md`.
-    - Current gaps: prompt/completion tokens are always `0`; “usage logs” and monthly cost-cap enforcement are not implemented.
-    - Code: `crates/llm_client/src/lib.rs`.
-  - **Tooling model: real tool-use protocol (JSON args/results + result hashes)** per `specs/coder/05-ai-response-agent.md`.
-    - Current: “tools” are deterministic string context builders, not LLM-invoked tool calls.
-    - Code: `crates/agent/src/lib.rs`, plus new tool interface crate/module.
   - **Guardrail rule alignment** (refund promise allowlist/policy patterns, supported language config, restaurant-name self-reference alternative) per `specs/coder/05-ai-response-agent.md`.
     - Code: `crates/domain/src/guardrails.rs`.
-  - **Replace hard-coded “Chez Luca” defaults with persisted restaurant settings** (name, cuisine, hours, signature dishes, voice) per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md` (`/api/v1/settings`).
+  - **Replace hard-coded "Chez Luca" defaults with persisted restaurant settings** (name, cuisine, hours, signature dishes, voice) per `specs/coder/16-frontend-web-ui.md` and `specs/coder/11-api-design.md` (`/api/v1/settings`).
     - Resolved (v0.1): `domain::RestaurantSettings` + migration `0005_restaurant_settings.sql`; repo `get/put_restaurant_settings`; JSON `GET/PUT /api/v1/settings`; web settings form; `agent_worker` loads settings and builds `AgentConfig` via `agent_config_from_settings`.
     - Remaining: validate patch fields against spec limits; optional versioning of settings for audit.
     - Code: `crates/domain/src/settings.rs`, `crates/storage/migrations/0005_restaurant_settings.sql`, `crates/storage/src/{repo.rs,pg.rs,memory.rs}`, `crates/agent/src/lib.rs`, `crates/server/src/main.rs`, `crates/api/src/{v1.rs,web_ui.rs,store.rs}`.
 - **P2 — Spec-complete platform behaviors**
   - **Google adapter watermark + stop paging** + configurable host/path, jittered backoff up to 5 minutes, drift detection/withdrawn handling per `specs/coder/02-google-reviews-integration.md`.
     - Code: `crates/adapters/google/src/lib.rs`, `crates/adapters/google/src/normalize.rs`.
-  - **UberEats polling “since”** watermark + DLQ behavior + drift detection (don’t double-reply) per `specs/coder/03-ubereats-reviews-integration.md`.
+  - **UberEats polling "since"** watermark + DLQ behavior + drift detection (don't double-reply) per `specs/coder/03-ubereats-reviews-integration.md`.
     - Code: `crates/adapters/ubereats/src/lib.rs`, `crates/adapters/ubereats/src/normalize.rs`, `crates/api/src/webhooks.rs`.
 - **P3 — Observability, operations, and test coverage**
   - **Telemetry bootstrap** (JSON logs in prod, OTLP tracing, redaction, standard span fields) per `specs/coder/12-observability.md`.
     - Current: minimal fmt subscriber only.
-    - Code: `crates/common/src/lib.rs`, all binaries’ `main.rs`.
+    - Code: `crates/common/src/lib.rs`, all binaries' `main.rs`.
   - **Metrics emission for core flows** (ingestion/agent/posting/notifications/http/db) per `specs/coder/12-observability.md`.
   - **Readiness checks** (DB + secrets reachable) per `specs/coder/12-observability.md` and `specs/coder/11-api-design.md`.
     - Current: `/readyz` now does repository ping and returns `503` `application/problem+json` on failure; secrets backend exists, but health/permission checks for production backends remain to be hardened.
@@ -117,13 +107,10 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
   - **Implement config loading via `figment` + `APP_ENV` + `APP_` env prefix** per `specs/coder/13-deployment-infra.md` and `specs/coder/10-rust-tech-stack.md`.
     - Current: ad-hoc env reads, inconsistent naming (`APP_BIND_ADDR` vs `DATABASE_URL` vs `ANTHROPIC_API_KEY`), and no `config/` directory.
     - Code: `crates/common`, all binaries, `crates/storage/src/pg.rs`.
-  - **Server role selection flag (`--roles`) and SIGTERM shutdown** per `specs/coder/10-rust-tech-stack.md` and `specs/coder/13-deployment-infra.md`.
-    - Current: server always starts all workers; shutdown listens to Ctrl+C only.
-    - Code: `crates/server/src/main.rs`.
   - **Deployment scaffolding** (Dockerfile, config files, roles flags, CI steps) per `specs/coder/13-deployment-infra.md`.
   - **Testing layers called out in spec** (storage IT with testcontainers, e2e crate, eval binary, undo-window tests) per `specs/coder/14-testing-strategy.md`.
-  - **Finish CLI operational commands** (`google-auth` flow, token rotation, migrate status, replay tools) per `specs/coder/09-auth-and-secrets.md`, `specs/coder/08-data-storage.md`, `specs/coder/10-rust-tech-stack.md`.
-    - Current: `google-auth` and `migrate status` are placeholders.
+  - **Finish CLI operational commands** (`google-auth` flow, token rotation, replay tools) per `specs/coder/09-auth-and-secrets.md`, `specs/coder/08-data-storage.md`, `specs/coder/10-rust-tech-stack.md`.
+    - Current: `google-auth` is a placeholder; `migrate status` now implemented.
     - Code: `crates/cli/src/main.rs`.
 - **Completed (this session)**
   - **RFC 9457 Problem Details + request path for `instance`**: extended problem JSON shape; task-local request path capture.
@@ -136,17 +123,17 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/api/src/web_ui.rs`, `crates/api/src/auth_cookies.rs`, `crates/api/templates/`, `crates/api/Cargo.toml`, `crates/api/build.rs`
   - **`ReplyDraft::is_active` includes `ApprovedPendingUndo`**: keeps bulk-approved drafts visible during undo window.
     - Code: `crates/domain/src/model.rs`
-  - **Storage upsert semantics for reviews (pg + memory)**: switched to “update on conflict” semantics (no more `DO NOTHING`); refreshes stored review data when a duplicate `(platform, source_review_id)` arrives.
+  - **Storage upsert semantics for reviews (pg + memory)**: switched to "update on conflict" semantics (no more `DO NOTHING`); refreshes stored review data when a duplicate `(platform, source_review_id)` arrives.
     - Code: `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
   - **Google polling stop-at-watermark persisted via `reviews_sync_state`**: persist/read watermark so polling stops correctly and resumes without re-scanning.
     - Code: `crates/storage/src/{pg.rs,repo.rs}`, `crates/api/src/store.rs`
   - **UberEats webhook replay protection (event_id or sha256 fallback) + tests**: dedupe webhook deliveries using provider `event_id` when present, else a sha256 fallback; added coverage around replay behavior.
     - Code: `crates/api/src/webhooks.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
-  - **Enforce bulk approve 10s undo window gating (backend + repo guard)**: prevent posting/processing until the undo window has elapsed; added repo-level guard so workers can’t bypass API/UI timing.
+  - **Enforce bulk approve 10s undo window gating (backend + repo guard)**: prevent posting/processing until the undo window has elapsed; added repo-level guard so workers can't bypass API/UI timing.
     - Code: `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/server/src/main.rs`
   - **Audit events writing (pg + memory) + ability to list audit events**: write audit rows for key mutations and expose read/list capability.
     - Code: `crates/domain/src/audit.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/api/src/v1.rs`
-  - **Minimal RBAC (viewer read-only) + CSRF double-submit checks for mutating endpoints**: added “viewer cannot mutate” enforcement and CSRF double-submit verification on write routes.
+  - **Minimal RBAC (viewer read-only) + CSRF double-submit checks for mutating endpoints**: added "viewer cannot mutate" enforcement and CSRF double-submit verification on write routes.
     - Code: `crates/api/src/v1.rs`
   - **Idempotency-Key caching for approve/reject/bulk/undo (repo-backed) + migrations**: persist idempotency keys to prevent duplicate mutations; added schema changes.
     - Migrations: `crates/storage/migrations/0003_idempotency_keys.sql`
@@ -175,3 +162,22 @@ Bullet list of **spec gaps not yet implemented**, sorted by priority (P0 highest
     - Code: `crates/api/src/login_rate_limit.rs`, `crates/api/src/{v1.rs,web_ui.rs,lib.rs}`
   - **Secrets backend + encryption helpers + server wiring**: added `Secrets` backend crate and encryption helper crate; server loads `APP_SESSION_SECRET` and platform/LLM secrets through `Secrets`.
     - Code: `crates/secrets`, `crates/encryption`, `crates/server/src/main.rs`, `crates/api/src/store.rs`
+  - **Durable work_jobs workflow (spec 17)**: `agent_worker` claims `agent_draft_review` jobs; `poster_worker` claims `poster_post_reply` jobs; `ingest_review` enqueues `agent_draft_review` jobs; `approve_draft` and `bulk_approve` enqueue `poster_post_reply` jobs.
+    - Code: `crates/server/src/main.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/api/src/v1.rs`
+  - **LLM cost cap enforcement**: `AnthropicClient` tracks monthly token spend with atomic accumulator; returns `LlmError::CostCapExceeded` when `monthly_cost_cap_usd` is exceeded; resets counter on new month.
+    - Code: `crates/llm_client/src/lib.rs`
+  - **Real Anthropic tool-use protocol**: tool-use API implemented with `ToolDefinition`, `ToolUseCall`, `generate_with_history`; agent uses real tool-use loop (max 3 iterations) with Anthropic API format; tools: `lookup_menu_item`, `lookup_policy`, `get_past_replies`, `check_banned_phrases`.
+    - Code: `crates/llm_client/src/lib.rs`, `crates/agent/src/lib.rs`
+  - **Storage GC worker**: `gc_worker` spawned hourly; enforces retention: `raw_payload` redact after 90d, `agent_runs` delete after 180d, `notifications_outbox` delete sent after 30d, `webhook_events` delete after 24h, `idempotency_responses` delete after 24h.
+    - Code: `crates/server/src/main.rs` (`gc_worker`), `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **Password reset flow**: `password_reset_tokens` table (migration 0009); `POST /api/v1/auth/password-reset/request` (always 200, no enumeration); `POST /api/v1/auth/password-reset/confirm` (validates token, updates password); single-use tokens, SHA-256 hash storage, 30-minute expiry, 12-character minimum password.
+    - Migrations: `crates/storage/migrations/0009_password_reset_tokens.sql`
+    - Code: `crates/api/src/v1.rs`, `crates/storage/src/{pg.rs,memory.rs,repo.rs}`
+  - **CLI migrate status**: `PgRepository::migration_status()` implemented using sqlx migration info; CLI shows Version/Description/Status table, exits 1 if pending migrations remain.
+    - Code: `crates/cli/src/main.rs`, `crates/storage/src/pg.rs`
+  - **`--roles` flag + SIGTERM shutdown**: `--roles` CLI flag (clap) defaults to `"api,ingestion,agent,poster,notifier,sla,gc"`; SIGTERM handled via `tokio::signal::unix` on Unix platforms.
+    - Code: `crates/server/src/main.rs`
+  - **Notifier lease expiry**: `release_stale_notification_claims()` resets outbox claims older than 5 minutes; `notifier_worker` calls this before each batch to prevent stuck/duplicate delivery.
+    - Code: `crates/storage/src/{pg.rs,memory.rs,repo.rs}`, `crates/server/src/main.rs`
+  - **Ingestion failure notifications**: `ingestion_worker` enqueues `NotificationType::IngestionFailure` after 3 consecutive adapter failures.
+    - Code: `crates/server/src/main.rs` (`ingestion_worker`)

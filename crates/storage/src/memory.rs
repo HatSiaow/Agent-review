@@ -38,6 +38,9 @@ struct State {
 
     work_jobs: HashMap<Uuid, WorkJob>,
     work_jobs_by_type_dedupe: HashMap<(WorkJobType, String), Uuid>,
+
+    /// token_hash -> (id, user_id, created_at, expires_at, used_at)
+    password_reset_tokens: HashMap<String, (Uuid, Uuid, OffsetDateTime, OffsetDateTime, Option<OffsetDateTime>)>,
 }
 
 impl InMemoryRepository {
@@ -819,6 +822,27 @@ impl Repository for InMemoryRepository {
         Ok(())
     }
 
+    async fn release_stale_notification_claims(
+        &self,
+        claim_cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let stale_ids: Vec<Uuid> = state
+            .notification_outbox_claimed
+            .iter()
+            .filter(|(id, (_, claimed_at))| {
+                *claimed_at < claim_cutoff
+                    && !state.notification_outbox_sent_at.contains_key(*id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let count = stale_ids.len() as u64;
+        for id in stale_ids {
+            state.notification_outbox_claimed.remove(&id);
+        }
+        Ok(count)
+    }
+
     async fn enqueue_work_job(
         &self,
         id: Uuid,
@@ -909,6 +933,136 @@ impl Repository for InMemoryRepository {
         job.run_after = run_after;
         job.updated_at = now;
         Ok(())
+    }
+
+    async fn create_password_reset_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Uuid> {
+        let id = Uuid::new_v4();
+        let mut state = self.0.lock().await;
+        state
+            .password_reset_tokens
+            .entry(token_hash.to_string())
+            .or_insert((id, user_id, now, expires_at, None));
+        Ok(id)
+    }
+
+    async fn consume_password_reset_token(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<Uuid>> {
+        let mut state = self.0.lock().await;
+        let Some(entry) = state.password_reset_tokens.get_mut(token_hash) else {
+            return Ok(None);
+        };
+        let (_, user_id, _, expires_at, used_at) = entry;
+        if *expires_at <= now || used_at.is_some() {
+            return Ok(None);
+        }
+        let uid = *user_id;
+        *used_at = Some(now);
+        Ok(Some(uid))
+    }
+
+    async fn update_user_password_hash(
+        &self,
+        user_id: Uuid,
+        new_password_hash: &str,
+    ) -> RepositoryResult<()> {
+        let mut state = self.0.lock().await;
+        if !state.users.contains_key(&user_id) {
+            return Err(RepositoryError::NotFound);
+        }
+        state
+            .users_auth
+            .entry(user_id)
+            .and_modify(|(hash, _)| *hash = new_password_hash.to_string())
+            .or_insert_with(|| (new_password_hash.to_string(), None));
+        state.audit_events.push(AuditEvent::new(
+            ActorType::User,
+            Some(user_id),
+            "user",
+            user_id,
+            EventType::PasswordReset,
+            serde_json::json!({}),
+        ));
+        Ok(())
+    }
+
+    async fn gc_delete_expired_reset_tokens(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let before = state.password_reset_tokens.len();
+        state
+            .password_reset_tokens
+            .retain(|_, (_, _, _, expires_at, used_at)| *expires_at >= cutoff && used_at.is_none());
+        let after = state.password_reset_tokens.len();
+        Ok(u64::try_from(before - after).unwrap_or(u64::MAX))
+    }
+
+    async fn gc_redact_raw_payloads(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let empty = serde_json::json!({});
+        let mut count = 0_u64;
+        for review in state.reviews.values_mut() {
+            if review.ingested_at < cutoff && review.raw_payload != empty {
+                review.raw_payload = empty.clone();
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn gc_delete_agent_runs(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let mut count = 0_u64;
+        for runs in state.agent_runs.values_mut() {
+            let before = runs.len();
+            runs.retain(|r| r.created_at >= cutoff);
+            count += u64::try_from(before - runs.len()).unwrap_or(0);
+        }
+        state.agent_runs.retain(|_, runs| !runs.is_empty());
+        Ok(count)
+    }
+
+    async fn gc_delete_sent_notifications(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let ids_to_remove: Vec<Uuid> = state
+            .notification_outbox_sent_at
+            .iter()
+            .filter(|(_, &sent_at)| sent_at < cutoff)
+            .map(|(&id, _)| id)
+            .collect();
+        let count = u64::try_from(ids_to_remove.len()).unwrap_or(0);
+        for id in ids_to_remove {
+            state.notification_outbox.remove(&id);
+            state.notification_outbox_sent_at.remove(&id);
+            state.notification_outbox_claimed.remove(&id);
+        }
+        Ok(count)
+    }
+
+    async fn gc_delete_old_webhook_events(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let before = state.webhook_events.len();
+        state.webhook_events.retain(|_, &mut received_at| received_at >= cutoff);
+        Ok(u64::try_from(before - state.webhook_events.len()).unwrap_or(0))
+    }
+
+    async fn gc_delete_expired_idempotency_keys(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let mut state = self.0.lock().await;
+        let before = state.idempotency_responses.len();
+        state
+            .idempotency_responses
+            .retain(|_, (_, _, created_at)| *created_at >= cutoff);
+        Ok(u64::try_from(before - state.idempotency_responses.len()).unwrap_or(0))
     }
 }
 
@@ -1179,6 +1333,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn password_reset_token_happy_path() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let expires_at = now + time::Duration::minutes(30);
+
+        // The seeded owner user has a known id.
+        let user_id = Uuid::from_u128(1);
+
+        let token_hash = "abc123deadbeef".to_string();
+        repo.create_password_reset_token(user_id, &token_hash, expires_at, now)
+            .await
+            .unwrap();
+
+        // Consuming before expiry should return the user_id.
+        let result = repo
+            .consume_password_reset_token(&token_hash, now + time::Duration::seconds(60))
+            .await
+            .unwrap();
+        assert_eq!(result, Some(user_id));
+
+        // Consuming a second time must return None (already used).
+        let second = repo
+            .consume_password_reset_token(&token_hash, now + time::Duration::seconds(90))
+            .await
+            .unwrap();
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_expired_returns_none() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let expires_at = now + time::Duration::minutes(30);
+        let user_id = Uuid::from_u128(1);
+
+        repo.create_password_reset_token(user_id, "tok_expired", expires_at, now)
+            .await
+            .unwrap();
+
+        // Consuming after expiry should return None.
+        let result = repo
+            .consume_password_reset_token("tok_expired", expires_at + time::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn password_reset_unknown_token_returns_none() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let result = repo
+            .consume_password_reset_token("not_a_real_token", now)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_user_password_hash_succeeds_and_writes_audit() {
+        let repo = InMemoryRepository::new();
+        let user_id = Uuid::from_u128(1);
+
+        repo.update_user_password_hash(user_id, "new_hash_value")
+            .await
+            .unwrap();
+
+        // Verify the new hash is stored.
+        let auth = repo
+            .get_user_auth_by_email("owner@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.password_hash, "new_hash_value");
+
+        // Verify audit event written.
+        let events = repo.list_audit_events("user", user_id).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == domain::EventType::PasswordReset));
+    }
+
+    #[tokio::test]
+    async fn update_user_password_hash_unknown_user_returns_not_found() {
+        let repo = InMemoryRepository::new();
+        let fake_id = Uuid::new_v4();
+        let result = repo.update_user_password_hash(fake_id, "hash").await;
+        assert!(matches!(result, Err(RepositoryError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn gc_delete_expired_reset_tokens_removes_expired() {
+        let repo = InMemoryRepository::new();
+        let now = datetime!(2026-04-15 10:00:00 UTC);
+        let user_id = Uuid::from_u128(1);
+
+        // Insert an already-expired token.
+        let expires_past = now - time::Duration::minutes(1);
+        repo.create_password_reset_token(user_id, "expired_tok", expires_past, now)
+            .await
+            .unwrap();
+
+        // Insert a valid token.
+        let expires_future = now + time::Duration::minutes(30);
+        repo.create_password_reset_token(user_id, "valid_tok", expires_future, now)
+            .await
+            .unwrap();
+
+        let deleted = repo.gc_delete_expired_reset_tokens(now).await.unwrap();
+        assert_eq!(deleted, 1, "only the expired token should be deleted");
+
+        // The valid token should still be consumable.
+        let result = repo
+            .consume_password_reset_token("valid_tok", now + time::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert_eq!(result, Some(user_id));
+    }
+
+    #[tokio::test]
     async fn work_jobs_claim_respects_run_after_ordering() {
         let repo = InMemoryRepository::new();
         let now = datetime!(2026-04-12 08:00:00 UTC);
@@ -1219,5 +1493,187 @@ mod tests {
             .unwrap();
         assert_eq!(claimed_later.len(), 1);
         assert_eq!(claimed_later[0].dedupe_key, "a");
+    }
+
+    #[tokio::test]
+    async fn gc_redact_raw_payloads_only_affects_old_reviews() {
+        let repo = InMemoryRepository::new();
+        let old_time = datetime!(2026-01-01 00:00:00 UTC);
+        let new_time = datetime!(2026-04-10 12:00:00 UTC);
+        let cutoff = datetime!(2026-03-01 00:00:00 UTC);
+
+        let mut old_review = make_review("old");
+        old_review.ingested_at = old_time;
+        old_review.raw_payload = json!({"sensitive": true});
+        repo.ingest_review(old_review.clone()).await.unwrap();
+
+        let mut new_review = make_review("new");
+        new_review.ingested_at = new_time;
+        new_review.raw_payload = json!({"sensitive": true});
+        repo.ingest_review(new_review.clone()).await.unwrap();
+
+        let count = repo.gc_redact_raw_payloads(cutoff).await.unwrap();
+        assert_eq!(count, 1);
+
+        let reviews = repo.list_reviews().await.unwrap();
+        for (r, _) in &reviews {
+            if r.source_review_id == "old" {
+                assert_eq!(r.raw_payload, json!({}), "old review should be redacted");
+            } else {
+                assert_eq!(
+                    r.raw_payload,
+                    json!({"sensitive": true}),
+                    "new review must not be redacted"
+                );
+            }
+        }
+
+        // Running again should return 0 (already redacted).
+        let count2 = repo.gc_redact_raw_payloads(cutoff).await.unwrap();
+        assert_eq!(count2, 0);
+    }
+
+    #[tokio::test]
+    async fn gc_delete_agent_runs_removes_old_entries() {
+        let repo = InMemoryRepository::new();
+        let review = make_review("r1");
+        let review_id = review.id;
+        repo.ingest_review(review).await.unwrap();
+
+        let base_run = domain::AgentRun {
+            id: Uuid::new_v4(),
+            review_id,
+            draft_id: None,
+            model_name: None,
+            prompt_fingerprint: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: None,
+            tool_calls_json: json!([]),
+            guardrail_verdict_json: None,
+            error: None,
+            created_at: datetime!(2026-01-01 00:00:00 UTC),
+        };
+        let new_run = domain::AgentRun {
+            id: Uuid::new_v4(),
+            created_at: datetime!(2026-04-10 12:00:00 UTC),
+            ..base_run.clone()
+        };
+        repo.store_agent_run(base_run).await.unwrap();
+        repo.store_agent_run(new_run).await.unwrap();
+
+        let cutoff = datetime!(2026-03-01 00:00:00 UTC);
+        let deleted = repo.gc_delete_agent_runs(cutoff).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let runs = repo.list_agent_runs(review_id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].created_at, datetime!(2026-04-10 12:00:00 UTC));
+    }
+
+    #[tokio::test]
+    async fn gc_delete_sent_notifications_removes_old_sent_items() {
+        let repo = InMemoryRepository::new();
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+
+        repo.enqueue_notification_outbox(
+            old_id,
+            datetime!(2026-01-01 00:00:00 UTC),
+            domain::NotificationType::DraftReady,
+            None,
+            None,
+            json!({}),
+        )
+        .await
+        .unwrap();
+        repo.enqueue_notification_outbox(
+            new_id,
+            datetime!(2026-04-10 12:00:00 UTC),
+            domain::NotificationType::DraftReady,
+            None,
+            None,
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+        repo.mark_notification_outbox_sent(old_id, datetime!(2026-01-02 00:00:00 UTC))
+            .await
+            .unwrap();
+        repo.mark_notification_outbox_sent(new_id, datetime!(2026-04-11 00:00:00 UTC))
+            .await
+            .unwrap();
+
+        let cutoff = datetime!(2026-03-01 00:00:00 UTC);
+        let deleted = repo.gc_delete_sent_notifications(cutoff).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let state = repo.0.lock().await;
+        assert!(!state.notification_outbox.contains_key(&old_id));
+        assert!(state.notification_outbox.contains_key(&new_id));
+    }
+
+    #[tokio::test]
+    async fn gc_delete_old_webhook_events_removes_expired() {
+        let repo = InMemoryRepository::new();
+        let old_time = datetime!(2026-01-01 00:00:00 UTC);
+        let new_time = datetime!(2026-04-10 12:00:00 UTC);
+        let cutoff = datetime!(2026-03-01 00:00:00 UTC);
+
+        // Insert directly into state to bypass the 24-hour auto-cleanup inside
+        // `register_webhook_event`, which would discard the old entry before GC runs.
+        {
+            let mut state = repo.0.lock().await;
+            state
+                .webhook_events
+                .insert((Platform::Google, "evt-old".to_string()), old_time);
+            state
+                .webhook_events
+                .insert((Platform::Google, "evt-new".to_string()), new_time);
+        }
+
+        let deleted = repo.gc_delete_old_webhook_events(cutoff).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let state = repo.0.lock().await;
+        assert!(!state
+            .webhook_events
+            .contains_key(&(Platform::Google, "evt-old".to_string())));
+        assert!(state
+            .webhook_events
+            .contains_key(&(Platform::Google, "evt-new".to_string())));
+    }
+
+    #[tokio::test]
+    async fn gc_delete_expired_idempotency_keys_removes_old_entries() {
+        let repo = InMemoryRepository::new();
+        let old_time = datetime!(2026-01-01 00:00:00 UTC);
+        let new_time = datetime!(2026-04-10 12:00:00 UTC);
+        let cutoff = datetime!(2026-03-01 00:00:00 UTC);
+
+        repo.put_idempotency_response("old-key", 200, json!({"ok": true}), old_time)
+            .await
+            .unwrap();
+        repo.put_idempotency_response("new-key", 201, json!({"ok": true}), new_time)
+            .await
+            .unwrap();
+
+        let deleted = repo
+            .gc_delete_expired_idempotency_keys(cutoff)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        assert!(repo
+            .get_idempotency_response("old-key")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .get_idempotency_response("new-key")
+            .await
+            .unwrap()
+            .is_some());
     }
 }

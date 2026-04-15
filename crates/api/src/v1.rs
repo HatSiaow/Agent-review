@@ -30,6 +30,8 @@ pub fn router() -> Router<Store> {
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
+        .route("/auth/password-reset/request", post(password_reset_request))
+        .route("/auth/password-reset/confirm", post(password_reset_confirm))
         .route("/reviews", get(list_reviews))
         .route("/drafts", get(list_drafts))
         .route("/settings", get(get_settings).put(put_settings))
@@ -674,6 +676,87 @@ async fn undo_bulk_approve(
     Ok(Json(updated))
 }
 
+// --- Password reset ---
+
+#[derive(Debug, Deserialize)]
+struct PasswordResetRequestBody {
+    email: String,
+}
+
+/// Request a password reset token. Always returns 200 to prevent email enumeration.
+///
+/// In production, the token would be emailed to the user. In this build, the raw
+/// token is returned in the `x-reset-token` response header for local dev and testing.
+async fn password_reset_request(
+    State(store): State<Store>,
+    Json(req): Json<PasswordResetRequestBody>,
+) -> (HeaderMap, http::StatusCode) {
+    use rand::RngCore as _;
+    use sha2::{Digest as _, Sha256};
+
+    let now = OffsetDateTime::now_utc();
+    let expires_at = now + time::Duration::minutes(30);
+
+    let Ok(Some(auth)) = store.get_user_auth_by_email(req.email.trim()).await else {
+        return (HeaderMap::new(), http::StatusCode::OK);
+    };
+
+    let mut token_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let token_hex = hex::encode(token_bytes);
+
+    let token_hash = hex::encode(Sha256::digest(token_hex.as_bytes()));
+
+    let _ = store
+        .create_password_reset_token(auth.user.id, &token_hash, expires_at, now)
+        .await;
+
+    tracing::debug!(email = %req.email, "password reset token issued");
+
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = http::header::HeaderValue::from_str(&token_hex) {
+        headers.insert("x-reset-token", v);
+    }
+    (headers, http::StatusCode::OK)
+}
+
+#[derive(Debug, Deserialize)]
+struct PasswordResetConfirmBody {
+    token: String,
+    new_password: String,
+}
+
+async fn password_reset_confirm(
+    State(store): State<Store>,
+    Json(req): Json<PasswordResetConfirmBody>,
+) -> Result<http::StatusCode, ApiError> {
+    use sha2::{Digest as _, Sha256};
+
+    if req.new_password.len() < 12 {
+        return Err(ApiError::BadRequest("password must be at least 12 characters"));
+    }
+
+    let token_hash = hex::encode(Sha256::digest(req.token.as_bytes()));
+
+    let now = OffsetDateTime::now_utc();
+    let Some(user_id) = store.consume_password_reset_token(&token_hash, now).await? else {
+        return Err(ApiError::BadRequest("invalid or expired reset token"));
+    };
+
+    use argon2::password_hash::{PasswordHasher as _, SaltString, rand_core::OsRng};
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = argon2::Argon2::default()
+        .hash_password(req.new_password.as_bytes(), &salt)
+        .map_err(|_| ApiError::ServiceUnavailable)?
+        .to_string();
+
+    store
+        .update_user_password_hash(user_id, &password_hash)
+        .await?;
+
+    Ok(http::StatusCode::OK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,7 +775,10 @@ mod tests {
             "APP_SESSION_SECRET",
             "test-test-test-test-test-test-test-test-1234",
         );
-        crate::login_rate_limit::reset_for_tests();
+        // Do NOT call reset_for_tests() here: clearing the entire global
+        // rate-limit state races with the login_rate_limit unit tests that
+        // run concurrently in the same process. Per-email cleanup inside
+        // each test that touches the rate-limiter is sufficient.
     }
 
     fn oneshot(app: Router, req: Request<Body>) -> http::Response<axum::body::Body> {
@@ -1323,11 +1409,228 @@ mod tests {
         assert_eq!(res2.status(), StatusCode::OK);
     }
 
+    // --- Password reset endpoint tests ---
+
+    fn extract_reset_token(res: &http::Response<axum::body::Body>) -> Option<String> {
+        res.headers()
+            .get("x-reset-token")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn password_reset_request_unknown_email_returns_200_no_token_header() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let body =
+            serde_json::to_string(&json!({"email": "nobody@example.com"})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/request")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(extract_reset_token(&res).is_none(), "no token for unknown email");
+    }
+
+    #[test]
+    fn password_reset_request_known_email_returns_token_header() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let body =
+            serde_json::to_string(&json!({"email": "owner@example.com"})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/request")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+        let token = extract_reset_token(&res).expect("token header present for known email");
+        assert_eq!(token.len(), 64, "token is 64 hex chars");
+    }
+
+    #[test]
+    fn password_reset_confirm_full_flow() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store.clone());
+
+        // Step 1: request a reset token.
+        let req_body =
+            serde_json::to_string(&json!({"email": "owner@example.com"})).unwrap();
+        let res = oneshot(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/request")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+        let token = extract_reset_token(&res).expect("token header");
+
+        // Step 2: confirm with the token and a new password.
+        let new_password = "SuperSecret123!";
+        let confirm_body = serde_json::to_string(&json!({
+            "token": token,
+            "new_password": new_password,
+        }))
+        .unwrap();
+        let app2 = build_router(store.clone());
+        let confirm_res = oneshot(
+            app2,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/confirm")
+                .header("content-type", "application/json")
+                .body(Body::from(confirm_body))
+                .unwrap(),
+        );
+        assert_eq!(confirm_res.status(), StatusCode::OK);
+
+        // Step 3: log in with the new password.
+        let login_body = serde_json::to_string(&json!({
+            "email": "owner@example.com",
+            "password": new_password,
+        }))
+        .unwrap();
+        let app3 = build_router(store);
+        let login_res = oneshot(
+            app3,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(login_body))
+                .unwrap(),
+        );
+        assert_eq!(login_res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn password_reset_confirm_invalid_token_returns_400() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store);
+        let body = serde_json::to_string(&json!({
+            "token": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "new_password": "ValidPassword123!",
+        }))
+        .unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/confirm")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn password_reset_confirm_short_password_returns_400() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store.clone());
+
+        // Get a valid token first.
+        let req_body =
+            serde_json::to_string(&json!({"email": "owner@example.com"})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/request")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body))
+                .unwrap(),
+        );
+        let token = extract_reset_token(&res).unwrap();
+
+        let body = serde_json::to_string(&json!({
+            "token": token,
+            "new_password": "short",
+        }))
+        .unwrap();
+        let app2 = build_router(store);
+        let confirm_res = oneshot(
+            app2,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/confirm")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        );
+        assert_eq!(confirm_res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn password_reset_confirm_token_single_use() {
+        let (store, _, _) = seeded_store();
+        let app = build_router(store.clone());
+
+        // Get a token.
+        let req_body =
+            serde_json::to_string(&json!({"email": "owner@example.com"})).unwrap();
+        let res = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/request")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body))
+                .unwrap(),
+        );
+        let token = extract_reset_token(&res).unwrap();
+
+        // First use: success.
+        let confirm_body = serde_json::to_string(&json!({
+            "token": token,
+            "new_password": "ValidPassword456!",
+        }))
+        .unwrap();
+        let app2 = build_router(store.clone());
+        let res1 = oneshot(
+            app2,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/confirm")
+                .header("content-type", "application/json")
+                .body(Body::from(confirm_body.clone()))
+                .unwrap(),
+        );
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        // Second use with same token: must fail.
+        let app3 = build_router(store);
+        let res2 = oneshot(
+            app3,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/password-reset/confirm")
+                .header("content-type", "application/json")
+                .body(Body::from(confirm_body))
+                .unwrap(),
+        );
+        assert_eq!(res2.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn login_rate_limiter_blocks_after_repeated_failures() {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
         let email = "owner+ratelimit@example.com";
+        // Clear per-email state so prior runs or parallel tests don't interfere.
+        crate::login_rate_limit::record_success(email);
         for _ in 0..5 {
             let body = serde_json::to_string(&json!({
                 "email": email,
@@ -1361,5 +1664,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
+        // Clean up so subsequent test runs start with a fresh slate for this email.
+        crate::login_rate_limit::record_success(email);
     }
 }

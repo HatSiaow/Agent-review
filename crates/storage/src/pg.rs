@@ -40,6 +40,17 @@ pub struct PgRepository {
     pool: PgPool,
 }
 
+/// Status of a single embedded migration.
+#[derive(Debug)]
+pub struct MigrationStatus {
+    /// Numeric version extracted from the migration filename (e.g. `0001` → `1`).
+    pub version: i64,
+    /// Human-readable description from the migration filename.
+    pub description: String,
+    /// Whether the migration has been successfully applied to the database.
+    pub applied: bool,
+}
+
 impl PgRepository {
     pub async fn connect(config: &PgRepositoryConfig) -> Result<Self, sqlx::Error> {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -62,6 +73,44 @@ impl PgRepository {
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         // Embeds `crates/storage/migrations/*.sql` into the binary at compile time.
         sqlx::migrate!("./migrations").run(&self.pool).await
+    }
+
+    /// Returns the status of every embedded migration: whether it has been applied or is pending.
+    ///
+    /// If the `_sqlx_migrations` table does not yet exist (fresh database), all migrations are
+    /// reported as pending.
+    pub async fn migration_status(&self) -> Result<Vec<MigrationStatus>, sqlx::Error> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            version: i64,
+            success: bool,
+        }
+
+        let applied_rows: Vec<Row> = sqlx::query_as(
+            "select version, success from _sqlx_migrations order by version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let applied_set: std::collections::HashSet<i64> = applied_rows
+            .iter()
+            .filter(|r| r.success)
+            .map(|r| r.version)
+            .collect();
+
+        let migrator = sqlx::migrate!("./migrations");
+        let statuses = migrator
+            .migrations
+            .iter()
+            .map(|m| MigrationStatus {
+                version: m.version,
+                description: m.description.to_string(),
+                applied: applied_set.contains(&m.version),
+            })
+            .collect();
+
+        Ok(statuses)
     }
 }
 
@@ -1588,6 +1637,26 @@ impl Repository for PgRepository {
         Ok(())
     }
 
+    async fn release_stale_notification_claims(
+        &self,
+        claim_cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            r"
+            update notifications_outbox
+            set claimed_at = null, claimed_by = null
+            where claimed_at < $1
+              and sent_at is null
+            ",
+        )
+        .bind(claim_cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
     async fn enqueue_work_job(
         &self,
         id: Uuid,
@@ -1761,5 +1830,154 @@ impl Repository for PgRepository {
             return Err(RepositoryError::NotFound);
         }
         Ok(())
+    }
+
+    async fn create_password_reset_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into password_reset_tokens (id, user_id, token_hash, created_at, expires_at)
+            values ($1, $2, $3, $4, $5)
+            on conflict (token_hash) do nothing
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(id)
+    }
+
+    async fn consume_password_reset_token(
+        &self,
+        token_hash: &str,
+        now: OffsetDateTime,
+    ) -> RepositoryResult<Option<Uuid>> {
+        let result: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            update password_reset_tokens
+            set used_at = $1
+            where token_hash = $2
+              and expires_at > $1
+              and used_at is null
+            returning user_id
+            "#,
+        )
+        .bind(now)
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
+    async fn update_user_password_hash(
+        &self,
+        user_id: Uuid,
+        new_password_hash: &str,
+    ) -> RepositoryResult<()> {
+        let rows = sqlx::query("update users set password_hash = $1 where id = $2")
+            .bind(new_password_hash)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
+        if rows == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        self.append_audit(domain::AuditEvent::new(
+            domain::ActorType::User,
+            Some(user_id),
+            "user",
+            user_id,
+            domain::EventType::PasswordReset,
+            serde_json::json!({}),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn gc_delete_expired_reset_tokens(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            "delete from password_reset_tokens where expires_at < $1 or used_at is not null",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_redact_raw_payloads(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            "update reviews set raw_payload = '{}'::jsonb \
+             where ingested_at < $1 and raw_payload <> '{}'::jsonb",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_agent_runs(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query("delete from agent_runs where created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_sent_notifications(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query(
+            "delete from notifications_outbox where sent_at is not null and sent_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Storage(e.to_string()))?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_old_webhook_events(&self, cutoff: OffsetDateTime) -> RepositoryResult<u64> {
+        let rows = sqlx::query("delete from webhook_events where received_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
+        Ok(rows)
+    }
+
+    async fn gc_delete_expired_idempotency_keys(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> RepositoryResult<u64> {
+        let rows = sqlx::query("delete from idempotency_responses where created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::Storage(e.to_string()))?
+            .rows_affected();
+        Ok(rows)
     }
 }

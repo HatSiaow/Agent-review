@@ -1,12 +1,59 @@
 use adapter_google::GoogleReviewClient as _;
 use adapter_ubereats::UberEatsReviewClient as _;
 use anyhow::Context as _;
+use clap::Parser;
 use secrecy::ExposeSecret as _;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Parser)]
+#[command(name = "server", about = "Neighbourhood Restaurant Review Agent server")]
+struct ServerArgs {
+    /// Comma-separated list of roles to run.
+    /// Options: api,ingestion,agent,poster,notifier,sla,gc
+    /// Default: all roles
+    #[arg(long, default_value = "api,ingestion,agent,poster,notifier,sla,gc")]
+    roles: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ServerRole {
+    Api,
+    Ingestion,
+    Agent,
+    Poster,
+    Notifier,
+    Sla,
+    Gc,
+}
+
+impl ServerRole {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "api" => Some(Self::Api),
+            "ingestion" => Some(Self::Ingestion),
+            "agent" => Some(Self::Agent),
+            "poster" => Some(Self::Poster),
+            "notifier" => Some(Self::Notifier),
+            "sla" => Some(Self::Sla),
+            "gc" => Some(Self::Gc),
+            other => {
+                tracing::warn!("unknown server role ignored: {other}");
+                None
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     common::init_tracing().context("init tracing")?;
+
+    let args = ServerArgs::parse();
+    let roles: std::collections::HashSet<ServerRole> = args
+        .roles
+        .split(',')
+        .filter_map(ServerRole::from_str)
+        .collect();
 
     let bind_addr = std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
 
@@ -43,38 +90,84 @@ async fn main() -> anyhow::Result<()> {
             ubereats_webhook_secret,
         )
     };
-    let app = api::router(store.clone());
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("bind {bind_addr}"))?;
-
-    tracing::info!("listening on {}", listener.local_addr()?);
 
     let cancel = CancellationToken::new();
+
+    // Respond to both SIGINT (Ctrl-C) and SIGTERM (e.g. `kill` / Kubernetes pod eviction).
     let cancel2 = cancel.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown signal received");
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                tracing::info!("SIGINT received, shutting down");
+            }
+            _ = terminate => {
+                tracing::info!("SIGTERM received, shutting down");
+            }
+        }
         cancel2.cancel();
     });
 
-    // Background workers (in-process) — minimal wiring for v0.1.
-    spawn_workers(store.clone(), cancel.clone());
+    // Background workers (in-process) — only roles explicitly enabled.
+    spawn_workers(store.clone(), cancel.clone(), &roles);
 
-    let server =
-        axum::serve(listener, app).with_graceful_shutdown(async move { cancel.cancelled().await });
+    if roles.contains(&ServerRole::Api) {
+        let app = api::router(store.clone());
+        let listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("bind {bind_addr}"))?;
+        tracing::info!("listening on {}", listener.local_addr()?);
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { cancel.cancelled().await })
+            .await
+            .context("serve")?;
+    } else {
+        tracing::info!("api role not active; running background workers only");
+        cancel.cancelled().await;
+    }
 
-    server.await.context("serve")?;
     Ok(())
 }
 
-fn spawn_workers(store: api::Store, cancel: CancellationToken) {
-    tokio::spawn(ingestion_worker(store.clone(), cancel.clone()));
-    tokio::spawn(agent_worker(store.clone(), cancel.clone()));
-    tokio::spawn(poster_worker(store.clone(), cancel.clone()));
-    tokio::spawn(sla_worker(store.clone(), cancel.clone()));
-    tokio::spawn(notifier_worker(store, cancel));
+fn spawn_workers(
+    store: api::Store,
+    cancel: CancellationToken,
+    roles: &std::collections::HashSet<ServerRole>,
+) {
+    if roles.contains(&ServerRole::Ingestion) {
+        tokio::spawn(ingestion_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Agent) {
+        tokio::spawn(agent_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Poster) {
+        tokio::spawn(poster_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Sla) {
+        tokio::spawn(sla_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Notifier) {
+        tokio::spawn(notifier_worker(store.clone(), cancel.clone()));
+    }
+    if roles.contains(&ServerRole::Gc) {
+        tokio::spawn(gc_worker(store, cancel));
+    }
 }
 
 fn should_process_google_review(
@@ -206,6 +299,10 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
         ubereats_cfg.poll_interval_secs,
     ));
 
+    let mut google_consecutive_failures: u32 = 0;
+    let mut ubereats_consecutive_failures: u32 = 0;
+    const INGESTION_FAILURE_THRESHOLD: u32 = 3;
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -216,21 +313,57 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
                 let cfg = google_cfg.clone();
                 let store2 = store.clone();
                 let last_seen = store2.get_reviews_sync_state(domain::Platform::Google).await;
-                if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
+
+                let result = tokio::task::spawn_blocking(move || {
                     adapter_google::HttpGoogleClient::new().list_reviews(&cfg)
-                }).await {
-                    let mut max_seen: Option<time::OffsetDateTime> = last_seen;
-                    for raw in raws {
-                        if let Ok(review) = adapter_google::normalize_google_review(&raw) {
-                            if !should_process_google_review(last_seen, review.updated_at) {
-                                break; // stop-at-watermark
+                }).await;
+
+                match result {
+                    Ok(Ok(raws)) => {
+                        google_consecutive_failures = 0;
+                        let mut max_seen: Option<time::OffsetDateTime> = last_seen;
+                        for raw in raws {
+                            if let Ok(review) = adapter_google::normalize_google_review(&raw) {
+                                if !should_process_google_review(last_seen, review.updated_at) {
+                                    break; // stop-at-watermark
+                                }
+                                max_seen = Some(max_seen.map_or(review.updated_at, |m| m.max(review.updated_at)));
+                                store2.ingest_review(review).await;
                             }
-                            max_seen = Some(max_seen.map_or(review.updated_at, |m| m.max(review.updated_at)));
-                            store2.ingest_review(review).await;
+                        }
+                        if let Some(max_seen) = max_seen {
+                            store2.set_reviews_sync_state(domain::Platform::Google, max_seen).await;
                         }
                     }
-                    if let Some(max_seen) = max_seen {
-                        store2.set_reviews_sync_state(domain::Platform::Google, max_seen).await;
+                    Ok(Err(e)) => {
+                        google_consecutive_failures += 1;
+                        tracing::warn!(
+                            error = %e,
+                            consecutive_failures = google_consecutive_failures,
+                            "google ingestion adapter error"
+                        );
+                        if google_consecutive_failures >= INGESTION_FAILURE_THRESHOLD {
+                            let notification_id = stable_notification_id(
+                                &format!("ingestion_failure_google_{}", google_consecutive_failures),
+                                uuid::Uuid::from_u128(0),
+                            );
+                            store.enqueue_notification_outbox(
+                                notification_id,
+                                time::OffsetDateTime::now_utc(),
+                                domain::NotificationType::IngestionFailure,
+                                None,
+                                None,
+                                serde_json::json!({
+                                    "kind": "ingestion_failure",
+                                    "platform": "google",
+                                    "consecutive_failures": google_consecutive_failures,
+                                    "error": e.to_string()
+                                }),
+                            ).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "google ingestion spawn_blocking panicked");
                     }
                 }
             }
@@ -238,24 +371,60 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
                 let cfg = ubereats_cfg.clone();
                 let store2 = store.clone();
                 let last_seen = store2.get_reviews_sync_state(domain::Platform::Ubereats).await;
-                if let Ok(Ok(raws)) = tokio::task::spawn_blocking(move || {
+
+                let result = tokio::task::spawn_blocking(move || {
                     adapter_ubereats::HttpUberEatsClient::new().list_reviews(&cfg)
-                }).await {
-                    let mut max_seen: Option<time::OffsetDateTime> = last_seen;
-                    for raw in raws {
-                        if let Ok(review) = adapter_ubereats::normalize_ubereats_review(&raw) {
-                            if !should_process_ubereats_review(last_seen, &review) {
-                                continue;
+                }).await;
+
+                match result {
+                    Ok(Ok(raws)) => {
+                        ubereats_consecutive_failures = 0;
+                        let mut max_seen: Option<time::OffsetDateTime> = last_seen;
+                        for raw in raws {
+                            if let Ok(review) = adapter_ubereats::normalize_ubereats_review(&raw) {
+                                if !should_process_ubereats_review(last_seen, &review) {
+                                    continue;
+                                }
+                                let cursor_time = review_cursor_time(&review);
+                                max_seen = Some(max_seen.map_or(cursor_time, |m| m.max(cursor_time)));
+                                store2.ingest_review(review).await;
                             }
-                            let cursor_time = review_cursor_time(&review);
-                            max_seen = Some(max_seen.map_or(cursor_time, |m| m.max(cursor_time)));
-                            store2.ingest_review(review).await;
+                        }
+                        if let Some(max_seen) = max_seen {
+                            store2
+                                .set_reviews_sync_state(domain::Platform::Ubereats, max_seen)
+                                .await;
                         }
                     }
-                    if let Some(max_seen) = max_seen {
-                        store2
-                            .set_reviews_sync_state(domain::Platform::Ubereats, max_seen)
-                            .await;
+                    Ok(Err(e)) => {
+                        ubereats_consecutive_failures += 1;
+                        tracing::warn!(
+                            error = %e,
+                            consecutive_failures = ubereats_consecutive_failures,
+                            "ubereats ingestion adapter error"
+                        );
+                        if ubereats_consecutive_failures >= INGESTION_FAILURE_THRESHOLD {
+                            let notification_id = stable_notification_id(
+                                &format!("ingestion_failure_ubereats_{}", ubereats_consecutive_failures),
+                                uuid::Uuid::from_u128(0),
+                            );
+                            store.enqueue_notification_outbox(
+                                notification_id,
+                                time::OffsetDateTime::now_utc(),
+                                domain::NotificationType::IngestionFailure,
+                                None,
+                                None,
+                                serde_json::json!({
+                                    "kind": "ingestion_failure",
+                                    "platform": "ubereats",
+                                    "consecutive_failures": ubereats_consecutive_failures,
+                                    "error": e.to_string()
+                                }),
+                            ).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "ubereats ingestion spawn_blocking panicked");
                     }
                 }
             }
@@ -280,6 +449,7 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
         Box::new(llm_client::InMemoryLlm::default())
     };
 
+    let worker_id = format!("agent-worker-{}", uuid::Uuid::new_v4());
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
 
     loop {
@@ -289,20 +459,67 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
                 return;
             }
             _ = tick.tick() => {
-                let agent_cfg = match store.get_restaurant_settings().await {
-                    Ok(s) => agent::agent_config_from_settings(&s),
-                    Err(_) => agent::AgentConfig::default(),
-                };
-                let items = store.list_reviews().await;
-                for (review, active) in items {
-                    if review.status != domain::ReviewStatus::New {
-                        continue;
-                    }
-                    if active.is_some() {
+                let now = time::OffsetDateTime::now_utc();
+                let jobs = store
+                    .claim_work_jobs(storage::WorkJobType::AgentDraftReview, 5, &worker_id, now)
+                    .await;
+
+                for job in jobs {
+                    let review_id = match job
+                        .payload_json
+                        .get("review_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    {
+                        Some(id) => id,
+                        None => {
+                            tracing::warn!(job_id = %job.id, "agent work job missing review_id in payload");
+                            store
+                                .mark_work_job_failed(
+                                    job.id,
+                                    "missing review_id in payload",
+                                    storage::WorkJobState::DeadLetter,
+                                    now,
+                                    now,
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+
+                    let (review, active_draft) = match store.get_review(review_id).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(job_id = %job.id, review_id = %review_id, error = %e, "review not found for agent work job");
+                            store
+                                .mark_work_job_failed(
+                                    job.id,
+                                    "review not found",
+                                    storage::WorkJobState::DeadLetter,
+                                    now,
+                                    now,
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+
+                    // Skip if already has a draft or is not in a draftable state.
+                    if active_draft.is_some()
+                        || !matches!(
+                            review.status,
+                            domain::ReviewStatus::New | domain::ReviewStatus::Drafting
+                        )
+                    {
+                        store.mark_work_job_succeeded(job.id, now).await;
                         continue;
                     }
 
-                    // Draft immediately for new reviews.
+                    let agent_cfg = match store.get_restaurant_settings().await {
+                        Ok(s) => agent::agent_config_from_settings(&s),
+                        Err(_) => agent::AgentConfig::default(),
+                    };
+
                     match agent::run_agent(llm.as_ref(), &agent_cfg, &review, None).await {
                         Ok(res) => {
                             let draft_id = res.draft.id;
@@ -322,7 +539,6 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
                                     }),
                                 )
                                 .await;
-
                             let run = domain::AgentRun {
                                 id: uuid::Uuid::new_v4(),
                                 review_id,
@@ -339,9 +555,30 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
                                 created_at: time::OffsetDateTime::now_utc(),
                             };
                             store.store_agent_run(run).await;
+                            store.mark_work_job_succeeded(job.id, now).await;
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, review_id = %review.id, "agent drafting failed");
+                            tracing::warn!(job_id = %job.id, review_id = %review_id, error = %e, "agent drafting failed");
+                            let attempts = job.attempts + 1;
+                            let (next_state, run_after) = if attempts >= job.max_attempts {
+                                (storage::WorkJobState::DeadLetter, now)
+                            } else {
+                                let delay_secs =
+                                    5u64.saturating_mul(2u64.saturating_pow(attempts as u32));
+                                (
+                                    storage::WorkJobState::Pending,
+                                    now + time::Duration::seconds(delay_secs as i64),
+                                )
+                            };
+                            store
+                                .mark_work_job_failed(
+                                    job.id,
+                                    &e.to_string(),
+                                    next_state,
+                                    run_after,
+                                    now,
+                                )
+                                .await;
                         }
                     }
                 }
@@ -457,6 +694,7 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
     }
     let http_poster = poster::HttpPlatformPoster::new(Some(google_cfg), Some(ubereats_cfg));
 
+    let worker_id = format!("poster-worker-{}", uuid::Uuid::new_v4());
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
 
     loop {
@@ -466,36 +704,129 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
                 return;
             }
             _ = tick.tick() => {
-                let drafts = store.list_drafts().await;
-                for draft in drafts {
+                let now = time::OffsetDateTime::now_utc();
+                let jobs = store
+                    .claim_work_jobs(storage::WorkJobType::PosterPostReply, 5, &worker_id, now)
+                    .await;
+
+                for job in jobs {
+                    let draft_id = match job
+                        .payload_json
+                        .get("draft_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    {
+                        Some(id) => id,
+                        None => {
+                            tracing::warn!(job_id = %job.id, "poster work job missing draft_id in payload");
+                            store
+                                .mark_work_job_failed(
+                                    job.id,
+                                    "missing draft_id in payload",
+                                    storage::WorkJobState::DeadLetter,
+                                    now,
+                                    now,
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+
+                    let review_id = match job
+                        .payload_json
+                        .get("review_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    {
+                        Some(id) => id,
+                        None => {
+                            tracing::warn!(job_id = %job.id, "poster work job missing review_id in payload");
+                            store
+                                .mark_work_job_failed(
+                                    job.id,
+                                    "missing review_id in payload",
+                                    storage::WorkJobState::DeadLetter,
+                                    now,
+                                    now,
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+
+                    let (review, active_draft) = match store.get_review(review_id).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(job_id = %job.id, draft_id = %draft_id, error = %e, "review not found for poster work job");
+                            store
+                                .mark_work_job_failed(
+                                    job.id,
+                                    "review not found",
+                                    storage::WorkJobState::DeadLetter,
+                                    now,
+                                    now,
+                                )
+                                .await;
+                            continue;
+                        }
+                    };
+
+                    // Verify the target draft is still the active draft for this review.
+                    let draft = match active_draft {
+                        Some(d) if d.id == draft_id => d,
+                        _ => {
+                            // Already posted, rejected, or superseded — nothing to do.
+                            store.mark_work_job_succeeded(job.id, now).await;
+                            continue;
+                        }
+                    };
+
                     if draft.posted_at.is_some() {
+                        store.mark_work_job_succeeded(job.id, now).await;
                         continue;
                     }
-                    let now = time::OffsetDateTime::now_utc();
+
+                    // Check eligibility (state + undo window).
                     let eligible = match draft.state {
-                        domain::DraftState::Approved => {
-                            match draft.post_eligible_at {
-                                None => true,
-                                Some(t) => now >= t,
-                            }
-                        }
-                        domain::DraftState::ApprovedPendingUndo => {
-                            match draft.post_eligible_at {
-                                None => false,
-                                Some(t) => now >= t,
-                            }
-                        }
+                        domain::DraftState::Approved => match draft.post_eligible_at {
+                            None => true,
+                            Some(t) => now >= t,
+                        },
+                        domain::DraftState::ApprovedPendingUndo => match draft.post_eligible_at {
+                            None => false,
+                            Some(t) => now >= t,
+                        },
                         _ => false,
                     };
+
                     if !eligible {
+                        // run_after is set to post_eligible_at so this should be rare (clock skew).
+                        let retry_after = draft
+                            .post_eligible_at
+                            .unwrap_or_else(|| now + time::Duration::seconds(5));
+                        store
+                            .mark_work_job_failed(
+                                job.id,
+                                "not yet eligible for posting",
+                                storage::WorkJobState::Pending,
+                                retry_after,
+                                now,
+                            )
+                            .await;
                         continue;
                     }
 
-                    let Ok((review, _)) = store.get_review(draft.review_id).await else {
-                        continue;
-                    };
-
                     if poster::validate_for_posting(&draft).is_err() {
+                        tracing::warn!(job_id = %job.id, draft_id = %draft_id, "draft failed posting validation");
+                        store
+                            .mark_work_job_failed(
+                                job.id,
+                                "draft failed posting validation",
+                                storage::WorkJobState::DeadLetter,
+                                now,
+                                now,
+                            )
+                            .await;
                         continue;
                     }
 
@@ -505,13 +836,18 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
                         review.platform,
                         &review.source_review_id,
                         &draft.text,
-                    ).await;
+                    )
+                    .await;
 
                     match result {
                         Ok(()) => {
-                            let _ = store.mark_draft_posted(draft.id, time::OffsetDateTime::now_utc()).await;
+                            let _ = store
+                                .mark_draft_posted(draft.id, time::OffsetDateTime::now_utc())
+                                .await;
+                            store.mark_work_job_succeeded(job.id, now).await;
                         }
                         Err(e) => {
+                            tracing::warn!(job_id = %job.id, draft_id = %draft_id, error = %e, "draft posting failed");
                             let _ = store.mark_draft_post_failed(draft.id, e.to_string()).await;
                             store
                                 .enqueue_notification_outbox(
@@ -529,8 +865,77 @@ async fn poster_worker(store: api::Store, cancel: CancellationToken) {
                                     }),
                                 )
                                 .await;
+                            let attempts = job.attempts + 1;
+                            let (next_state, run_after) = if attempts >= job.max_attempts {
+                                (storage::WorkJobState::DeadLetter, now)
+                            } else {
+                                let delay_secs =
+                                    5u64.saturating_mul(2u64.saturating_pow(attempts as u32));
+                                (
+                                    storage::WorkJobState::Pending,
+                                    now + time::Duration::seconds(delay_secs as i64),
+                                )
+                            };
+                            store
+                                .mark_work_job_failed(
+                                    job.id,
+                                    &e.to_string(),
+                                    next_state,
+                                    run_after,
+                                    now,
+                                )
+                                .await;
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+async fn gc_worker(store: api::Store, cancel: CancellationToken) {
+    // Run GC once per hour.
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3_600));
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::info!("gc worker stopped");
+                return;
+            }
+            _ = tick.tick() => {
+                let now = time::OffsetDateTime::now_utc();
+
+                let raw_payload_cutoff = now - time::Duration::days(90);
+                let agent_runs_cutoff = now - time::Duration::days(180);
+                let outbox_cutoff = now - time::Duration::days(30);
+                let webhook_cutoff = now - time::Duration::hours(24);
+                let idempotency_cutoff = now - time::Duration::hours(24);
+
+                let redacted = store.gc_redact_raw_payloads(raw_payload_cutoff).await;
+                if redacted > 0 {
+                    tracing::info!(count = redacted, "gc: redacted raw_payload on old reviews");
+                }
+
+                let deleted_runs = store.gc_delete_agent_runs(agent_runs_cutoff).await;
+                if deleted_runs > 0 {
+                    tracing::info!(count = deleted_runs, "gc: deleted old agent_runs");
+                }
+
+                let deleted_notifs = store.gc_delete_sent_notifications(outbox_cutoff).await;
+                if deleted_notifs > 0 {
+                    tracing::info!(count = deleted_notifs, "gc: deleted old sent notifications");
+                }
+
+                let deleted_webhooks = store.gc_delete_old_webhook_events(webhook_cutoff).await;
+                if deleted_webhooks > 0 {
+                    tracing::info!(count = deleted_webhooks, "gc: deleted old webhook_events");
+                }
+
+                let deleted_idempotency =
+                    store.gc_delete_expired_idempotency_keys(idempotency_cutoff).await;
+                if deleted_idempotency > 0 {
+                    tracing::info!(count = deleted_idempotency, "gc: deleted expired idempotency keys");
                 }
             }
         }
@@ -697,13 +1102,22 @@ async fn notifier_worker(store: api::Store, cancel: CancellationToken) {
                 return;
             }
             _ = tick.tick() => {
+                let now = time::OffsetDateTime::now_utc();
+
+                // Release stale claims (worker crash recovery) — claims older than 5 minutes.
+                let stale_cutoff = now - time::Duration::minutes(5);
+                let released = store.release_stale_notification_claims(stale_cutoff).await;
+                if released > 0 {
+                    tracing::info!(released, "released stale notification outbox claims");
+                }
+
                 let quiet_hours = store
                     .get_restaurant_settings()
                     .await
                     .ok()
                     .and_then(|s| s.notifier_quiet_hours)
                     .and_then(|raw| parse_quiet_hours(&raw));
-                let current_hour = time::OffsetDateTime::now_utc().hour();
+                let current_hour = now.hour();
 
                 let batch = store.claim_notification_outbox_batch(50).await;
                 let mut digest_ready = Vec::new();
