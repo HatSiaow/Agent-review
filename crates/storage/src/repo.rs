@@ -1,5 +1,6 @@
 use domain::ReplyDraft;
 use domain::Review;
+use domain::RestaurantSettings;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -16,6 +17,45 @@ pub enum RepositoryError {
 }
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
+
+/// Queue tab for the owner inbox (`specs/coder/16-frontend-web-ui.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueTab {
+    NeedsYouNow,
+    ReadyToSend,
+    History,
+}
+
+/// Sort order for `list_reviews_filtered`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReviewSort {
+    #[default]
+    UpdatedAtDesc,
+    UpdatedAtAsc,
+    RatingDesc,
+    CreatedAtDesc,
+}
+
+/// Filters for listing reviews (API query params).
+#[derive(Debug, Clone, Default)]
+pub struct ReviewListQuery {
+    pub platform: Option<domain::Platform>,
+    pub status: Option<domain::ReviewStatus>,
+    pub rating: Option<u8>,
+    /// Case-insensitive substring match on author display name and review body.
+    pub q: Option<String>,
+    pub queue: Option<QueueTab>,
+    pub sort: ReviewSort,
+}
+
+/// Filters for listing drafts.
+#[derive(Debug, Clone, Default)]
+pub struct DraftListQuery {
+    pub state: Option<domain::DraftState>,
+    pub rating: Option<u8>,
+    /// When `true`, only drafts with at least one guardrail warning.
+    pub flag_warnings: Option<bool>,
+}
 
 /// Authentication-focused view of a user.
 ///
@@ -40,6 +80,13 @@ pub trait Repository: Send + Sync + 'static {
     async fn ping(&self) -> RepositoryResult<()>;
 
     async fn list_reviews(&self) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>>;
+
+    /// Filtered + sorted review list for the JSON API and HTML queue.
+    async fn list_reviews_filtered(
+        &self,
+        query: ReviewListQuery,
+    ) -> RepositoryResult<Vec<(Review, Option<ReplyDraft>)>>;
+
     async fn get_review(&self, id: Uuid) -> RepositoryResult<(Review, Option<ReplyDraft>)>;
 
     async fn ingest_review(&self, review: Review) -> RepositoryResult<()>;
@@ -104,6 +151,9 @@ pub trait Repository: Send + Sync + 'static {
     async fn unskip_review(&self, review_id: Uuid) -> RepositoryResult<Review>;
 
     async fn list_drafts(&self) -> RepositoryResult<Vec<ReplyDraft>>;
+
+    async fn list_drafts_filtered(&self, query: DraftListQuery)
+        -> RepositoryResult<Vec<ReplyDraft>>;
     async fn store_agent_draft(&self, draft: ReplyDraft) -> RepositoryResult<()>;
 
     /// Persist a trace record for a single agent run.
@@ -159,6 +209,15 @@ pub trait Repository: Send + Sync + 'static {
 
     /// Fetch a user record by id.
     async fn get_user_by_id(&self, user_id: Uuid) -> RepositoryResult<Option<domain::User>>;
+
+    /// All users for the single-restaurant deployment (owner UI).
+    async fn list_users(&self) -> RepositoryResult<Vec<domain::User>>;
+
+    /// Persisted restaurant profile (singleton). Missing row uses domain defaults.
+    async fn get_restaurant_settings(&self) -> RepositoryResult<RestaurantSettings>;
+
+    /// Replace settings from a full merged value (caller merges patch + defaults).
+    async fn put_restaurant_settings(&self, settings: RestaurantSettings) -> RepositoryResult<()>;
 
     /// Create a new server-side session.
     async fn create_session(

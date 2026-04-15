@@ -113,8 +113,6 @@ async fn ingestion_worker(store: api::Store, cancel: CancellationToken) {
 }
 
 async fn agent_worker(store: api::Store, cancel: CancellationToken) {
-    let agent_cfg = agent::AgentConfig::default();
-
     // Prefer Anthropic if configured; otherwise use the deterministic in-memory fake.
     let llm: Box<dyn llm_client::LlmClient> = if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         Box::new(llm_client::AnthropicClient::new(llm_client::LlmConfig {
@@ -134,6 +132,10 @@ async fn agent_worker(store: api::Store, cancel: CancellationToken) {
                 return;
             }
             _ = tick.tick() => {
+                let agent_cfg = match store.get_restaurant_settings().await {
+                    Ok(s) => agent::agent_config_from_settings(&s),
+                    Err(_) => agent::AgentConfig::default(),
+                };
                 let items = store.list_reviews().await;
                 for (review, active) in items {
                     if review.status != domain::ReviewStatus::New {

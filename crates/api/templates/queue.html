@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Queue — Neighbourhood Restaurant Review Agent</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    :root { --bg:#0f1419; --card:#1a2332; --text:#e8eef5; --muted:#8b9bb4; --accent:#3b82f6; }
+    body { font-family: system-ui, sans-serif; margin:0; background:var(--bg); color:var(--text); line-height:1.5; }
+    a { color:var(--accent); }
+    header { padding:1rem 1.5rem; border-bottom:1px solid #243044; display:flex; justify-content:space-between; flex-wrap:wrap; gap:0.75rem; }
+    main { padding:1.5rem; max-width:1100px; margin:0 auto; }
+    .card { background:var(--card); border-radius:8px; padding:1rem 1.25rem; margin-bottom:1rem; border:1px solid #243044; }
+    .muted { color:var(--muted); font-size:0.9rem; }
+    .row { display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center; }
+    button { background:var(--accent); color:white; border:none; padding:0.4rem 0.75rem; border-radius:6px; cursor:pointer; }
+    button.secondary { background:#334155; }
+    input, select { padding:0.5rem; border-radius:6px; border:1px solid #334155; background:#0b1018; color:var(--text); }
+    .tabs a { padding:0.35rem 0.75rem; border-radius:6px; }
+    .tabs a.active { background:#243044; }
+    .badge { display:inline-block; padding:0.15rem 0.45rem; border-radius:4px; font-size:0.8rem; background:#243044; }
+    .warn { color:#f59e0b; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Neighbourhood Restaurant Review Agent</strong>
+    <nav class="row">
+      <span class="muted">{{ user_email }}</span>
+      <a href="/">Queue</a>
+      <a href="/settings">Settings</a>
+      <a href="/users">Users</a>
+      <form method="post" action="/logout" style="display:inline;">
+        <input type="hidden" name="csrf" value="{{ csrf_token }}"/>
+        <button type="submit" class="secondary">Log out</button>
+      </form>
+    </nav>
+  </header>
+  <main>
+    <h1>Queue</h1>
+    <p class="muted">Human-in-the-loop tabs; filters align with <code>/api/v1/reviews</code>.</p>
+    <div class="tabs row" style="margin-bottom:1rem;">
+      <a href="/?tab=needs" class="{% if tab == "needs" %}active{% endif %}">Needs You Now</a>
+      <a href="/?tab=ready" class="{% if tab == "ready" %}active{% endif %}">Ready To Send</a>
+      <a href="/?tab=history" class="{% if tab == "history" %}active{% endif %}">History</a>
+    </div>
+    <form method="get" class="card row" style="gap:1rem; align-items:flex-end;">
+      <input type="hidden" name="tab" value="{{ tab }}"/>
+      <div style="flex:1; min-width:140px;">
+        <label class="muted">Platform</label><br/>
+        <select name="platform">
+          <option value="" {% if platform_filter == "" %}selected{% endif %}>All</option>
+          <option value="google" {% if platform_filter == "google" %}selected{% endif %}>Google</option>
+          <option value="ubereats" {% if platform_filter == "ubereats" %}selected{% endif %}>UberEats</option>
+        </select>
+      </div>
+      <div style="flex:1; min-width:100px;">
+        <label class="muted">Rating</label><br/>
+        <input type="number" name="rating" min="1" max="5" value="{{ rating_filter }}" placeholder="any"/>
+      </div>
+      <div style="flex:2; min-width:200px;">
+        <label class="muted">Search</label><br/>
+        <input type="search" name="q" value="{{ q }}" placeholder="Author or review text"/>
+      </div>
+      <button type="submit">Apply</button>
+    </form>
+    {% for row in rows %}
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <div>
+          <span class="badge">{{ row.platform }}</span>
+          <strong>{{ row.author }}</strong>
+          <span class="muted">· {{ row.rating }}★</span>
+          <span class="badge">{{ row.status }}</span>
+        </div>
+        <a href="/reviews/{{ row.id }}">Open</a>
+      </div>
+      <p>{{ row.body }}</p>
+      {% if row.draft_state != "" %}
+      <p><span class="muted">Draft ({{ row.draft_state }}):</span> {{ row.draft_text }}</p>
+      {% if row.draft_warn %}
+      <p class="warn">Guardrail warnings — needs careful review.</p>
+      {% endif %}
+      {% else %}
+      <p class="muted">No active draft</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+    {% if rows.is_empty() %}
+    <p class="muted">No reviews in this view.</p>
+    {% endif %}
+  </main>
+</body>
+</html>

@@ -304,12 +304,16 @@ impl ReplyDraft {
     }
 
     /// Whether this draft is in an active (non-terminal) state.
+    ///
+    /// Includes [`DraftState::ApprovedPendingUndo`](crate::fsm::DraftState::ApprovedPendingUndo) so
+    /// queue UIs still show bulk-approved items until posted or undone.
     #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(
             self.state,
             crate::fsm::DraftState::PendingReview
                 | crate::fsm::DraftState::Approved
+                | crate::fsm::DraftState::ApprovedPendingUndo
                 | crate::fsm::DraftState::Edited
         )
     }
