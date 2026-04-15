@@ -775,7 +775,10 @@ mod tests {
             "APP_SESSION_SECRET",
             "test-test-test-test-test-test-test-test-1234",
         );
-        crate::login_rate_limit::reset_for_tests();
+        // Do NOT call reset_for_tests() here: clearing the entire global
+        // rate-limit state races with the login_rate_limit unit tests that
+        // run concurrently in the same process. Per-email cleanup inside
+        // each test that touches the rate-limiter is sufficient.
     }
 
     fn oneshot(app: Router, req: Request<Body>) -> http::Response<axum::body::Body> {
@@ -1626,6 +1629,8 @@ mod tests {
         let (store, _, _) = seeded_store();
         let app = build_router(store);
         let email = "owner+ratelimit@example.com";
+        // Clear per-email state so prior runs or parallel tests don't interfere.
+        crate::login_rate_limit::record_success(email);
         for _ in 0..5 {
             let body = serde_json::to_string(&json!({
                 "email": email,
@@ -1659,5 +1664,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(blocked.status(), StatusCode::UNAUTHORIZED);
+        // Clean up so subsequent test runs start with a fresh slate for this email.
+        crate::login_rate_limit::record_success(email);
     }
 }
