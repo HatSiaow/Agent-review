@@ -228,13 +228,14 @@ impl Default for LlmConfig {
 /// - claude-opus-*: $15/$75 per 1M input/output tokens
 /// - all others (sonnet, etc.): $3/$15 per 1M input/output tokens
 fn compute_cost_microdollars(model: &str, input_tokens: u32, output_tokens: u32) -> u64 {
+    // Rates in µUSD per 1M tokens. Dividing by 1_000_000 gives cost per token in µUSD.
     let (input_rate, output_rate) = if model.contains("opus") {
-        (15_000_u64, 75_000_u64)
+        (15_000_000_u64, 75_000_000_u64)
     } else {
-        (3_000_u64, 15_000_u64)
+        (3_000_000_u64, 15_000_000_u64)
     };
-    let input_cost = (u64::from(input_tokens) * input_rate) / 1_000_000;
-    let output_cost = (u64::from(output_tokens) * output_rate) / 1_000_000;
+    let input_cost = u64::from(input_tokens) * input_rate / 1_000_000;
+    let output_cost = u64::from(output_tokens) * output_rate / 1_000_000;
     input_cost + output_cost
 }
 
@@ -706,10 +707,10 @@ mod tests {
 
     #[test]
     fn compute_cost_microdollars_small_tokens() {
-        // input: 1000 * 3000 / 1_000_000 = 3 µUSD
-        // output: 500 * 15_000 / 1_000_000 = 7 µUSD (integer division)
+        // input: 1000 * 3_000_000 / 1_000_000 = 3 µUSD
+        // output: 500 * 15_000_000 / 1_000_000 = 7 µUSD (integer division)
         let cost = compute_cost_microdollars("claude-sonnet-4-6", 1_000, 500);
-        assert_eq!(cost, 10);
+        assert_eq!(cost, 10_500);
     }
 
     #[tokio::test]
